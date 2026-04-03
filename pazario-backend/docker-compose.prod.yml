@@ -1,0 +1,147 @@
+version: '3.9'
+
+# Pazar.io — Production Deployment
+# Kullanım: docker-compose -f docker-compose.prod.yml up -d
+# Env dosyası gerekli: cp .env.example .env (ve production değerleri doldur)
+
+services:
+
+  # ── PostgreSQL 16 ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pazario-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-pazario}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-pazario_db}
+      POSTGRES_INITDB_ARGS: "-c max_connections=200"
+    ports:
+      # Production'da expose etmeyin veya sadece loopback'ten
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-pazario} -d ${DB_NAME:-pazario_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pazario-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pazario-redis
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+    ports:
+      # Production'da expose etmeyin
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pazario-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Backend Express API ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pazario-backend
+    restart: always
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TY_API_KEY: ${TY_API_KEY}
+      TY_API_SECRET: ${TY_API_SECRET}
+      TY_SUPPLIER_ID: ${TY_SUPPLIER_ID}
+      HB_MERCHANT_ID: ${HB_MERCHANT_ID}
+      HB_SERVICE_KEY: ${HB_SERVICE_KEY}
+      N11_APPKEY: ${N11_APPKEY}
+      N11_APPSECRET: ${N11_APPSECRET}
+      PZ_CLIENT_ID: ${PZ_CLIENT_ID}
+      PZ_CLIENT_SECRET: ${PZ_CLIENT_SECRET}
+      ARAS_API_KEY: ${ARAS_API_KEY}
+      YURTICI_API_KEY: ${YURTICI_API_KEY}
+      SURAT_API_KEY: ${SURAT_API_KEY}
+      PTT_API_KEY: ${PTT_API_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pazario-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ── Nginx Reverse Proxy (Optional) ─────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: pazario-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro  # SSL certificates
+    depends_on:
+      - backend
+    networks:
+      - pazario-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  pazario-network:
+    driver: bridge

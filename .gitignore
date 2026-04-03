@@ -1,0 +1,111 @@
+# ═══════════════════════════════════════════════════════════════════
+# PAZARIO - COMPREHENSIVE .gitignore
+# ═══════════════════════════════════════════════════════════════════
+
+# ENVIRONMENT & SECRETS ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+.env.test
+*.pem
+*.key
+*.crt
+
+# NODE ──────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# BUILD OUTPUTS ──────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+out/
+
+# IDE & EDITOR ──────────────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.prettierrc.json
+.eslintrc.json
+
+# OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# DATABASE ──────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+db/
+postgres_data/
+redis_data/
+backups/
+
+# LOGS ──────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TESTING ──────────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+.c8rc
+.mocha*
+
+# DOCKER ───────────────────────────────────────────────────────────
+.dockerignore
+docker-compose.override.yml
+.docker/
+
+# TEMP & CACHE ──────────────────────────────────────────────────────
+tmp/
+temp/
+.cache/
+.turbo/
+.next/
+.nuxt/
+
+# MISC ──────────────────────────────────────────────────────────────
+*.md.bak
+.generator/
+generated/
+*.pem
+.DS_Store
+.tool-versions
+
+# SECRETS PATTERNS ──────────────────────────────────────────────────
+# Deny common secret patterns
+**/secret*
+**/apikey*
+**/password*
+*.secret
+.secrets
+
+# KEEP tracked files (override ignore above)
+!.gitignore
+!.github/
+!.vscode/extensions.json
+!docker-compose.prod.yml
+!DEPLOYMENT_GUIDE.md
+!GITHUB_SECRETS_SETUP.sh
+
+# ═══════════════════════════════════════════════════════════════════

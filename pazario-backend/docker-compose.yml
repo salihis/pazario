@@ -1,0 +1,60 @@
+version: '3.9'
+
+# Pazar.io — Lokal Geliştirme Ortamı
+# Kullanım: docker-compose up -d
+
+services:
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pazario-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pazario
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pazario_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pazario -d pazario_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis 7 ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pazario-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Bull Board (Kuyruk İzleme UI) ───────────────────────────────────
+  bullboard:
+    image: deadly0/bull-board:latest
+    container_name: pazario-bullboard
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_USE_TLS: "false"
+    ports:
+      - "3001:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

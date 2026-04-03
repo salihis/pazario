@@ -1,0 +1,111 @@
+name: Deploy Backend (Production)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pazario-backend/**'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.example.com
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: pazario-backend
+
+      - name: Type check
+        run: npm run typecheck
+        working-directory: pazario-backend
+
+      - name: Run tests
+        run: npm test
+        working-directory: pazario-backend
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          NODE_ENV: test
+
+      - name: Build
+        run: npm run build
+        working-directory: pazario-backend
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg NODE_ENV=production \
+            -t pazario-backend:${{ github.sha }} \
+            -t pazario-backend:latest \
+            -f Dockerfile \
+            .
+        working-directory: pazario-backend
+
+      - name: Push to Registry (optional)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "Docker image ready for deployment:"
+          echo "pazario-backend:${{ github.sha }}"
+
+      - name: Deploy to Server
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "cd ${{ secrets.DEPLOY_PATH }} && \
+            docker-compose pull pazario-backend && \
+            docker-compose up -d pazario-backend && \
+            docker-compose logs -f pazario-backend --tail 10"
+
+      - name: Health Check
+        if: github.ref == 'refs/heads/main'
+        run: |
+          for i in {1..30}; do
+            if curl -f https://api.example.com/health; then
+              echo "✅ Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i/30..."
+            sleep 10
+          done
+          echo "❌ Health check failed"
+          exit 1
+
+      - name: Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Backend Deploy: ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Backend Deployment* ${{ job.status }}\nCommit: ${{ github.sha }}\nAuthor: ${{ github.actor }}"
+                  }
+                }
+              ]
+            }

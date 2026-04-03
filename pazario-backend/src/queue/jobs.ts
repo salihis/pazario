@@ -1,0 +1,30 @@
+// src/queue/jobs.ts
+
+export type Marketplace = 'TRENDYOL' | 'HEPSIBURADA' | 'N11' | 'PAZARAMA'
+
+export interface SyncJobData {
+  sourceId: string
+  triggeredBy: 'cron' | 'manual'
+  userId?: string
+}
+
+export interface PublishJobData {
+  productId: string
+  marketplace: Marketplace
+  syncJobId: string
+}
+
+export interface CargoJobData {
+  orderId: string
+  action: 'create_label' | 'notify_marketplace' | 'check_status'
+}
+
+export interface OrderFetchJobData {
+  marketplace: Marketplace | 'all'
+}
+
+export interface NotifyJobData {
+  type: 'slack' | 'email'
+  message: string
+  level: 'info' | 'warn' | 'error'
+}

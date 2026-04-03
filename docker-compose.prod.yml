@@ -1,0 +1,170 @@
+version: '3.9'
+
+# Pazar.io — Production Deployment
+# Kullanım: docker-compose -f docker-compose.prod.yml up -d
+
+services:
+
+  # ── PostgreSQL 16 (Production) ──────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pazario-postgres-prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-pazario}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-pazario_prod}
+      POSTGRES_INITDB_ARGS: "-c shared_buffers=256MB -c max_connections=200"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+      - ./backups:/backups:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-pazario}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pazario-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Redis 7 (Production) ────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pazario-redis-prod
+    restart: always
+    command:
+      - redis-server
+      - --appendonly yes
+      - --appendfsync everysec
+      - --maxmemory 512mb
+      - --maxmemory-policy allkeys-lru
+      - --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pazario-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Pazar.io Backend (Node.js + Express) ───────────────
+  backend:
+    build:
+      context: ./pazario-backend
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: production
+    container_name: pazario-backend-prod
+    restart: always
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # Database
+      DATABASE_URL: postgresql://${DB_USER:-pazario}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-pazario_prod}
+
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+
+      # Security
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY}
+
+      # CORS
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+
+      # Marketplace APIs
+      TY_API_KEY: ${TY_API_KEY}
+      TY_API_SECRET: ${TY_API_SECRET}
+      TY_SUPPLIER_ID: ${TY_SUPPLIER_ID}
+      N11_APPKEY: ${N11_APPKEY}
+      N11_APPSECRET: ${N11_APPSECRET}
+      HB_MERCHANT_ID: ${HB_MERCHANT_ID}
+      HB_SERVICE_KEY: ${HB_SERVICE_KEY}
+      PZ_CLIENT_ID: ${PZ_CLIENT_ID}
+      PZ_CLIENT_SECRET: ${PZ_CLIENT_SECRET}
+
+      # Cargo APIs
+      ARAS_API_KEY: ${ARAS_API_KEY}
+      YURTICI_API_KEY: ${YURTICI_API_KEY}
+      SURAT_API_KEY: ${SURAT_API_KEY}
+      PTT_API_KEY: ${PTT_API_KEY}
+
+      # AI/LLM
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+      # Notifications
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - pazario-net
+    volumes:
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Nginx (Reverse Proxy & Load Balancer) ───────────────
+  nginx:
+    image: nginx:alpine
+    container_name: pazario-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - backend
+    networks:
+      - pazario-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_prod_data:
+    driver: local
+  redis_prod_data:
+    driver: local
+
+networks:
+  pazario-net:
+    driver: bridge
