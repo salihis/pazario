@@ -9,6 +9,7 @@ interface OrderItem {
   unitPrice: number
   totalPrice: number
   sku: string | null
+  source: { id: string; name: string } | null
 }
 
 interface Order {
@@ -30,6 +31,12 @@ interface Order {
 interface OrdersResponse {
   data: Order[]
   meta: { total: number; page: number; limit: number }
+}
+
+interface OrderFetchSummary {
+  totalNew: number
+  durationMs: number
+  results: Array<{ marketplace: string; fetched: number; newOrders: number; errors: string[] }>
 }
 
 const TABS = [
@@ -83,6 +90,9 @@ export default function OrdersPage() {
   const [marketplace, setMarketplace] = useState('')
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null)
   const [page, setPage] = useState(1)
+  const [fetchMessage, setFetchMessage] = useState('')
+  const [emailTo, setEmailTo] = useState('')
+  const [emailMessage, setEmailMessage] = useState('')
   const limit = 25
 
   const { data, isLoading } = useQuery<OrdersResponse>({
@@ -122,6 +132,38 @@ export default function OrdersPage() {
     },
   })
 
+  const fetchMutation = useMutation({
+    mutationFn: () =>
+      api.post<{ success: boolean; data: OrderFetchSummary }>('/orders/fetch?wait=true').then(r => r.data.data),
+    onSuccess: result => {
+      const errors = result.results
+        .filter(item => item.errors.length > 0)
+        .map(item => `${item.marketplace}: ${item.errors[0]}`)
+      const summary = result.results
+        .map(item => `${item.marketplace} ${item.fetched}/${item.newOrders}`)
+        .join(', ')
+      setFetchMessage(`Siparis kontrolu tamamlandi. Yeni: ${result.totalNew}. ${summary}${errors.length ? ` | Hata: ${errors.join(' | ')}` : ''}`)
+      queryClient.invalidateQueries({ queryKey: ['orders'] })
+      queryClient.invalidateQueries({ queryKey: ['order-stats'] })
+    },
+    onError: (error: any) => {
+      setFetchMessage(error?.response?.data?.error || 'Siparis cekme basarisiz')
+    },
+  })
+
+  const testEmailMutation = useMutation({
+    mutationFn: () => api.post('/orders/email/test').then(r => r.data),
+    onSuccess: () => setEmailMessage('SMTP baglantisi dogrulandi.'),
+    onError: (error: any) => setEmailMessage(error?.response?.data?.error || 'SMTP test basarisiz'),
+  })
+
+  const sendEmailMutation = useMutation({
+    mutationFn: ({ orderId, to }: { orderId: string; to: string }) =>
+      api.post(`/orders/${orderId}/send-email`, { to }).then(r => r.data),
+    onSuccess: () => setEmailMessage('Siparis e-postasi gonderildi.'),
+    onError: (error: any) => setEmailMessage(error?.response?.data?.error || 'E-posta gonderilemedi'),
+  })
+
   const totalPages = data ? Math.ceil(data.meta.total / limit) : 1
 
   return (
@@ -133,12 +175,32 @@ export default function OrdersPage() {
           <p className="text-gray-400 text-sm mt-1">Tum pazaryeri siparisleri</p>
         </div>
         <button
-          onClick={() => api.post('/orders/fetch').then(() => queryClient.invalidateQueries({ queryKey: ['orders'] }))}
-          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          onClick={() => fetchMutation.mutate()}
+          disabled={fetchMutation.isPending}
+          className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
         >
-          Siparis Cek
+          {fetchMutation.isPending ? 'Siparisler cekiliyor...' : 'Siparis Cek'}
+        </button>
+        <button
+          onClick={() => testEmailMutation.mutate()}
+          disabled={testEmailMutation.isPending}
+          className="bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+        >
+          {testEmailMutation.isPending ? 'SMTP test...' : 'SMTP Test'}
         </button>
       </div>
+
+      {fetchMessage && (
+        <div className="mb-4 rounded-lg border border-blue-800 bg-blue-950/40 px-4 py-3 text-sm text-blue-100">
+          {fetchMessage}
+        </div>
+      )}
+
+      {emailMessage && (
+        <div className="mb-4 rounded-lg border border-emerald-800 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-100">
+          {emailMessage}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 mb-4 bg-gray-900 rounded-lg p-1 w-fit">
@@ -324,6 +386,9 @@ export default function OrdersPage() {
                   {selectedOrder.items.map(item => (
                     <div key={item.id} className="bg-gray-800 rounded-lg p-2">
                       <div className="text-xs text-gray-300 line-clamp-2">{item.title}</div>
+                      <div className="text-xs text-blue-300 mt-1">
+                        XML: {item.source?.name ?? 'Eslesmedi'}
+                      </div>
                       <div className="flex items-center justify-between mt-1">
                         <span className="text-xs text-gray-500">{item.quantity} adet</span>
                         <span className="text-xs text-green-400">
@@ -347,8 +412,24 @@ export default function OrdersPage() {
                   <div className="text-xs text-gray-500">{selectedOrder.cargoCompany}</div>
                 </div>
               )}
+              <div>
+                <div className="text-xs text-gray-500 mb-1">Siparis E-postasi</div>
+                <input
+                  value={emailTo}
+                  onChange={e => setEmailTo(e.target.value)}
+                  placeholder="musteri@ornek.com"
+                  className="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                />
+              </div>
             </div>
             <div className="p-4 border-t border-gray-800 space-y-2">
+              <button
+                onClick={() => selectedOrder && sendEmailMutation.mutate({ orderId: selectedOrder.id, to: emailTo })}
+                disabled={sendEmailMutation.isPending || !emailTo.trim()}
+                className="w-full bg-blue-700 hover:bg-blue-600 text-white text-sm py-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {sendEmailMutation.isPending ? 'E-posta gonderiliyor...' : 'E-posta Gonder'}
+              </button>
               {selectedOrder.status === 'NEW' && (
                 <button
                   onClick={() => approveMutation.mutate(selectedOrder.id)}

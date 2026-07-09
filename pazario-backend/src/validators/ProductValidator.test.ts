@@ -29,13 +29,12 @@ describe('ProductValidator', () => {
     expect(result.PAZARAMA.valid).toBe(true)
   })
 
-  it('should reject product without barcode for Trendyol', () => {
+  it('should use BRS-prefixed SKU when barcode is missing for Trendyol', () => {
     const product = { ...validProduct, barcode: null }
 
     const result = ProductValidator.validate(product, 'TRENDYOL')
 
-    expect(result.valid).toBe(false)
-    expect(result.errors[0]).toContain('Missing required field')
+    expect(result.valid).toBe(true)
   })
 
   it('should reject negative price', () => {
@@ -56,14 +55,22 @@ describe('ProductValidator', () => {
     expect(result.errors[0]).toContain('Title too long')
   })
 
-  it('should warn for zero stock', () => {
+  it('should reject product with stock below marketplace threshold', () => {
     const product = { ...validProduct, stock: 0 }
 
     const result = ProductValidator.validate(product, 'TRENDYOL')
 
-    expect(result.valid).toBe(true)
-    expect(result.warnings.length).toBeGreaterThan(0)
-    expect(result.warnings[0]).toContain('Stock')
+    expect(result.valid).toBe(false)
+    expect(result.errors[0]).toContain('Insufficient stock')
+  })
+
+  it('should reject product with stock equal to marketplace threshold', () => {
+    const product = { ...validProduct, stock: 6 }
+
+    const result = ProductValidator.validate(product, 'TRENDYOL')
+
+    expect(result.valid).toBe(false)
+    expect(result.errors[0]).toContain('must be > 6')
   })
 
   it('should warn for very high price', () => {
@@ -77,12 +84,20 @@ describe('ProductValidator', () => {
   })
 
   it('should reject invalid barcode format for Pazarama', () => {
-    const product = { ...validProduct, barcode: 'invalid' }
+    const product = { ...validProduct, barcode: 'invalid barcode' }
 
     const result = ProductValidator.validate(product, 'PAZARAMA')
 
     expect(result.valid).toBe(false)
     expect(result.errors.length).toBeGreaterThan(0)
+  })
+
+  it('should accept BRS-prefixed marketplace barcode for Pazarama', () => {
+    const product = { ...validProduct, barcode: 'BRSABC123' }
+
+    const result = ProductValidator.validate(product, 'PAZARAMA')
+
+    expect(result.valid).toBe(true)
   })
 
   it('should reject invalid SKU format for Hepsiburada', () => {

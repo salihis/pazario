@@ -11,6 +11,7 @@ export interface Product {
   stock: number
   sku: string
   barcode?: string
+  productMainId?: string
   images: string[]
   category?: string
   brand?: string

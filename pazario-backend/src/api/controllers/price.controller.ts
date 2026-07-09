@@ -2,39 +2,42 @@
 
 import { Request, Response } from 'express'
 import { PrismaClient } from '@prisma/client'
-import { PriceEngine } from '../../services/PriceEngine'
+import { PriceEngine, roundUpToNinetyNine } from '../../services/PriceEngine'
+import { logger } from '../../utils/logger'
 import { z } from 'zod'
 
 const prisma = new PrismaClient()
 const priceEngine = new PriceEngine(prisma)
 
-// ─── ŞEMALAR ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€ ÅEMALAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export const createRuleSchema = z.object({
   name: z.string().min(1).max(150),
   marketplace: z.string().min(1).max(50),
   scopeType: z.enum(['GLOBAL', 'MARKETPLACE', 'CATEGORY', 'BRAND', 'PRODUCT']),
   scopeValue: z.string().max(500).optional(),
+  priceStart: z.number().min(0).optional(),
+  priceEnd: z.number().min(0).optional(),
   ekTutar: z.number().min(0).default(0),
-  karOrani: z.number().min(1.0, 'Kar oranı en az 1.0 olmalı').max(9.9999),
+  karOrani: z.number().min(1.0, 'Kar oranÄ± en az 1.0 olmalÄ±').max(9.9999),
   kargo: z.number().min(0).default(0),
-  komisyonOrani: z.number().min(0).max(0.99, 'Komisyon oranı en fazla 0.99 olabilir'),
+  komisyonOrani: z.number().min(0).max(0.99, 'Komisyon oranÄ± en fazla 0.99 olabilir'),
   priority: z.number().int().positive(),
 })
 
 export const simulateSchema = z.object({
   basePrice: z.number().positive(),
   ekTutar: z.number().min(0),
-  karOrani: z.number().min(1.0, 'Kar oranı en az 1.0 olmalı'),
+  karOrani: z.number().min(1.0, 'Kar oranÄ± en az 1.0 olmalÄ±'),
   kargo: z.number().min(0),
-  komisyonOrani: z.number().min(0).max(0.99, 'Komisyon oranı en fazla 0.99 olabilir'),
+  komisyonOrani: z.number().min(0).max(0.99, 'Komisyon oranÄ± en fazla 0.99 olabilir'),
 })
 
-// ─── CONTROLLER FONKSİYONLARI ─────────────────────────────────────────────────
+// â”€â”€â”€ CONTROLLER FONKSÄ°YONLARI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /**
  * GET /price-rules
- * Fiyat kurallarını listeler
+ * Fiyat kurallarÄ±nÄ± listeler
  */
 export async function getRules(req: Request, res: Response) {
   try {
@@ -59,26 +62,26 @@ export async function getRules(req: Request, res: Response) {
 
     res.json({ success: true, data, meta: { total, page, limit } })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatası' })
+    res.status(500).json({ success: false, error: 'Sunucu hatasÄ±' })
   }
 }
 
 /**
  * POST /price-rules
- * Yeni fiyat kuralı oluşturur
+ * Yeni fiyat kuralÄ± oluÅŸturur
  */
 export async function createRule(req: Request, res: Response) {
   try {
     const rule = await prisma.priceRule.create({ data: req.body })
     res.status(201).json({ success: true, data: rule })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Kural oluşturulamadı' })
+    res.status(500).json({ success: false, error: 'Kural oluÅŸturulamadÄ±' })
   }
 }
 
 /**
  * PUT /price-rules/:ruleId
- * Fiyat kuralını günceller
+ * Fiyat kuralÄ±nÄ± gÃ¼nceller
  */
 export async function updateRule(req: Request, res: Response) {
   try {
@@ -88,13 +91,13 @@ export async function updateRule(req: Request, res: Response) {
     })
     res.json({ success: true, data: rule })
   } catch (e) {
-    res.status(404).json({ success: false, error: 'Kural bulunamadı' })
+    res.status(404).json({ success: false, error: 'Kural bulunamadÄ±' })
   }
 }
 
 /**
  * DELETE /price-rules/:ruleId
- * Soft delete — active=false yapar
+ * Soft delete â€” active=false yapar
  */
 export async function deleteRule(req: Request, res: Response) {
   try {
@@ -104,13 +107,13 @@ export async function deleteRule(req: Request, res: Response) {
     })
     res.json({ success: true })
   } catch (e) {
-    res.status(404).json({ success: false, error: 'Kural bulunamadı' })
+    res.status(404).json({ success: false, error: 'Kural bulunamadÄ±' })
   }
 }
 
 /**
  * POST /price-rules/simulate
- * DB kaydı oluşturmadan fiyat simüle eder
+ * DB kaydÄ± oluÅŸturmadan fiyat simÃ¼le eder
  */
 export async function simulatePrice(req: Request, res: Response) {
   try {
@@ -120,12 +123,13 @@ export async function simulatePrice(req: Request, res: Response) {
     const ara2Kar = ara1BaseEk * karOrani
     const ara3Kargo = ara2Kar + kargo
     const rawPrice = ara3Kargo / (1 - komisyonOrani)
-    const finalPrice = Math.round(rawPrice * 100) / 100
+    const roundedRawPrice = Math.round(rawPrice * 100) / 100
 
-    // Global min fiyat kontrolü
+    // Global min fiyat kontrolÃ¼
     const globalSetting = await prisma.globalPriceSetting.findFirst()
     const minPrice = globalSetting ? Number(globalSetting.minPrice) : 0
-    const minPriceApplied = finalPrice < minPrice
+    const minPriceApplied = roundedRawPrice < minPrice
+    const finalPrice = roundUpToNinetyNine(Math.max(roundedRawPrice, minPrice))
 
     res.json({
       success: true,
@@ -134,18 +138,18 @@ export async function simulatePrice(req: Request, res: Response) {
         ara2Kar: Math.round(ara2Kar * 100) / 100,
         ara3Kargo: Math.round(ara3Kargo * 100) / 100,
         rawPrice: Math.round(rawPrice * 100) / 100,
-        finalPrice: minPriceApplied ? minPrice : finalPrice,
+        finalPrice,
         minPriceApplied,
       },
     })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Simülasyon hatası' })
+    res.status(500).json({ success: false, error: 'SimÃ¼lasyon hatasÄ±' })
   }
 }
 
 /**
  * GET /price-rules/preview/:productId
- * Ürün için 4 pazaryeri fiyatını hesaplar
+ * ÃœrÃ¼n iÃ§in 4 pazaryeri fiyatÄ±nÄ± hesaplar
  */
 export async function previewProductPrice(req: Request, res: Response) {
   try {
@@ -153,12 +157,20 @@ export async function previewProductPrice(req: Request, res: Response) {
       where: { id: req.params.productId },
     })
     if (!product) {
-      res.status(404).json({ success: false, error: 'Ürün bulunamadı' })
+      res.status(404).json({ success: false, error: 'ÃœrÃ¼n bulunamadÄ±' })
       return
     }
 
+    interface PricePreviewResult {
+      marketplace: string
+      ruleName: string | null
+      finalPrice: number | null
+      minApplied: boolean
+      error?: string
+    }
+
     const marketplaces = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA'] as const
-    const results = []
+    const results: PricePreviewResult[] = []
 
     for (const mp of marketplaces) {
       try {
@@ -196,32 +208,32 @@ export async function previewProductPrice(req: Request, res: Response) {
       },
     })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatası' })
+    res.status(500).json({ success: false, error: 'Sunucu hatasÄ±' })
   }
 }
 
 /**
  * GET /price-settings
- * Global minimum fiyat ayarını döndürür
+ * Global minimum fiyat ayarÄ±nÄ± dÃ¶ndÃ¼rÃ¼r
  */
 export async function getSettings(req: Request, res: Response) {
   try {
     const setting = await prisma.globalPriceSetting.findFirst()
-    res.json({ success: true, data: setting })
+    res.json({ success: true, data: setting ?? { minPrice: 50, currency: 'TRY' } })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatası' })
+    res.status(500).json({ success: false, error: 'Sunucu hatasÄ±' })
   }
 }
 
 /**
  * PUT /price-settings
- * Global minimum fiyatı günceller
+ * Global minimum fiyatÄ± gÃ¼nceller
  */
 export async function updateSettings(req: Request, res: Response) {
   try {
     const { minPrice } = req.body
     if (!minPrice || minPrice <= 0) {
-      res.status(400).json({ success: false, error: 'Geçersiz minPrice' })
+      res.status(400).json({ success: false, error: 'GeÃ§ersiz minPrice' })
       return
     }
 
@@ -235,15 +247,26 @@ export async function updateSettings(req: Request, res: Response) {
           data: { minPrice, currency: 'TRY' },
         })
 
-    res.json({ success: true, data: setting })
+    // Arka planda: etkilenen listing'lerin hashAtPublish'ini sÄ±fÄ±rla
+    // BÃ¶ylece bir sonraki sync'te yeniden fiyat hesaplanÄ±r
+    prisma.marketplaceListing
+      .updateMany({
+        where: { hashAtPublish: { not: null } },
+        data: { hashAtPublish: null },
+      })
+      .catch((err: unknown) => {
+        logger.error({ err }, 'hashAtPublish sÄ±fÄ±rlama hatasÄ±')
+      })
+
+    res.json({ success: true, data: setting ?? { minPrice: 50, currency: 'TRY' } })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatası' })
+    res.status(500).json({ success: false, error: 'Sunucu hatasÄ±' })
   }
 }
 
 /**
  * GET /price-calculations
- * Fiyat hesaplama audit loglarını listeler
+ * Fiyat hesaplama audit loglarÄ±nÄ± listeler
  */
 export async function getCalculations(req: Request, res: Response) {
   try {
@@ -268,6 +291,6 @@ export async function getCalculations(req: Request, res: Response) {
 
     res.json({ success: true, data, meta: { total, page, limit } })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatası' })
+    res.status(500).json({ success: false, error: 'Sunucu hatasÄ±' })
   }
 }

@@ -9,7 +9,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─── ENUM'LAR ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ ENUM'LAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 enum SyncJobStatus {
   PENDING
@@ -47,25 +47,31 @@ enum ErrorType {
   @@map("error_type")
 }
 
-// ─── TABLOLAR ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ TABLOLAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// XML kaynak tanımları — tedarikçi feed URL'leri
+/// XML kaynak tanÄ±mlarÄ± â€” tedarikÃ§i feed URL'leri
 model XmlSource {
   id             String    @id @default(uuid()) @db.Uuid
-  name           String    @db.VarChar(100)
-  url            String
-  fetchTimeoutSec Int      @default(60)
+    name           String    @db.VarChar(100)
+    url            String
+    fallbackUrl    String?   @map("fallback_url")
+      fetchTimeoutSec Int      @default(60)
+    categoryIncludeKeywords String? @map("categoryincludekeywords") @db.VarChar(500)
+    autoSyncEnabled Boolean  @default(true)
+  autoSyncTime    String   @default("03:00") @db.VarChar(5)
+  lastAutoSyncAt  DateTime? @db.Timestamptz
   active         Boolean   @default(true)
   createdAt      DateTime  @default(now()) @db.Timestamptz
 
-  // İlişkiler
+  // Ä°liÅŸkiler
   syncJobs       SyncJob[]
   products       Product[]
   categoryMappings CategoryMapping[]
+  orderItems     OrderItem[]
   @@map("xml_sources")
 }
 
-/// Senkronizasyon işleri — her XML çekme işlemi bir job'dır
+/// Senkronizasyon iÅŸleri â€” her XML Ã§ekme iÅŸlemi bir job'dÄ±r
 model SyncJob {
   id              String        @id @default(uuid()) @db.Uuid
   sourceId        String        @db.Uuid
@@ -80,15 +86,16 @@ model SyncJob {
   finishedAt      DateTime?     @db.Timestamptz
   createdAt       DateTime      @default(now()) @db.Timestamptz
 
-  // İlişkiler
-  listings        MarketplaceListing[]
-  publishErrors   PublishError[]
+  // Ä°liÅŸkiler
+  listings          MarketplaceListing[]
+  publishErrors     PublishError[]
+  priceCalculations PriceCalculation[]
 
   @@map("sync_jobs")
 }
 
 
-/// Ürün kataloğu — tedarikçiden gelen normalize edilmiş ürünler
+/// ÃœrÃ¼n kataloÄŸu â€” tedarikÃ§iden gelen normalize edilmiÅŸ Ã¼rÃ¼nler
 model Product {
   id           String    @id @default(uuid()) @db.Uuid
   sourceId     String    @db.Uuid
@@ -111,11 +118,12 @@ model Product {
   createdAt    DateTime  @default(now()) @db.Timestamptz
   updatedAt    DateTime  @updatedAt @db.Timestamptz
 
-  // İlişkiler
-  listings     MarketplaceListing[]
-  publishErrors PublishError[]
-  productAttributes  ProductAttribute[]
-  publishJobs        ProductPublishJob[]
+  // Ä°liÅŸkiler
+  listings          MarketplaceListing[]
+  publishErrors     PublishError[]
+  productAttributes ProductAttribute[]
+  publishJobs       ProductPublishJob[]
+  priceCalculations PriceCalculation[]
 
   @@unique([sourceId, externalId])
   @@index([contentHash])
@@ -123,7 +131,7 @@ model Product {
   @@map("products")
 }
 
-/// Pazaryeri yayın durumları — her ürünün her pazaryerindeki durumu
+/// Pazaryeri yayÄ±n durumlarÄ± â€” her Ã¼rÃ¼nÃ¼n her pazaryerindeki durumu
 model MarketplaceListing {
   id                String        @id @default(uuid()) @db.Uuid
   productId         String        @db.Uuid
@@ -142,7 +150,33 @@ model MarketplaceListing {
   @@map("marketplace_listings")
 }
 
-/// Hata kayıtları — yayın sırasında oluşan hatalar
+/// Hata kayÄ±tlarÄ± â€” yayÄ±n sÄ±rasÄ±nda oluÅŸan hatalar
+/// Pazaryerinden okunan ham ürün listesi. Pazaryerleri ekranı yerel Product tablosunu değil bu tabloyu gösterir.
+model MarketplaceExternalProduct {
+  id                String        @id @default(uuid()) @db.Uuid
+  marketplace       Marketplace
+  listingKey        String        @db.VarChar(200)
+  externalListingId String?       @db.VarChar(200)
+  stockCode         String?       @db.VarChar(200)
+  barcode           String?       @db.VarChar(200)
+  title             String        @db.VarChar(700)
+  brand             String?       @db.VarChar(200)
+  categoryName      String?       @db.VarChar(700)
+  imageUrl          String?
+  price             Decimal?      @db.Decimal(12, 2)
+  stock             Int?
+  status            ListingStatus @default(PUBLISHED)
+  raw               Json          @default("{}")
+  firstSeenAt       DateTime      @default(now()) @db.Timestamptz
+  lastSeenAt        DateTime      @default(now()) @db.Timestamptz
+
+  @@unique([marketplace, listingKey])
+  @@index([marketplace, status])
+  @@index([stockCode])
+  @@index([barcode])
+  @@map("marketplace_external_products")
+}
+
 model PublishError {
   id           String    @id @default(uuid()) @db.Uuid
   jobId        String    @db.Uuid
@@ -160,7 +194,7 @@ model PublishError {
   @@index([resolved, marketplace])
   @@map("publish_errors")
 }
-// ─── FİYAT KURALLARI ─────────────────────────────────────────────────────────
+// â”€â”€â”€ FÄ°YAT KURALLARI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 enum PriceRuleScope {
   GLOBAL
@@ -180,13 +214,15 @@ enum CategoryMappingStatus {
   @@map("category_mapping_status")
 }
 
-/// Fiyat kuralları — pazaryeri bazlı kar/komisyon hesaplama
+/// Fiyat kurallarÄ± â€” pazaryeri bazlÄ± kar/komisyon hesaplama
 model PriceRule {
   id             String         @id @default(uuid()) @db.Uuid
   name           String         @db.VarChar(150)
   marketplace    String         @db.VarChar(50)
   scopeType      PriceRuleScope
   scopeValue     String?        @db.VarChar(500)
+  priceStart     Decimal?       @db.Decimal(12, 2)
+  priceEnd       Decimal?       @db.Decimal(12, 2)
   ekTutar        Decimal        @default(0) @db.Decimal(10, 2)
   karOrani       Decimal        @default(1.0) @db.Decimal(6, 4)
   kargo          Decimal        @default(0) @db.Decimal(10, 2)
@@ -197,21 +233,23 @@ model PriceRule {
   createdAt      DateTime       @default(now()) @db.Timestamptz
   updatedAt      DateTime       @updatedAt @db.Timestamptz
 
-  // İlişkiler
+  // Ä°liÅŸkiler
   calculations   PriceCalculation[]
 
   @@index([marketplace, scopeType, active])
   @@map("price_rules")
 }
 
-/// Fiyat hesaplama audit log — her hesaplama adım adım kaydedilir
+/// Fiyat hesaplama audit log â€” her hesaplama adÄ±m adÄ±m kaydedilir
 model PriceCalculation {
   id             String    @id @default(uuid()) @db.Uuid
   productId      String    @db.Uuid
+  product        Product   @relation(fields: [productId], references: [id])
   marketplace    String    @db.VarChar(50)
   ruleId         String    @db.Uuid
   rule           PriceRule @relation(fields: [ruleId], references: [id])
   syncJobId      String    @db.Uuid
+  syncJob        SyncJob   @relation(fields: [syncJobId], references: [id])
   basePrice      Decimal   @db.Decimal(12, 2)
   ekTutar        Decimal   @db.Decimal(10, 2)
   karOrani       Decimal   @db.Decimal(6, 4)
@@ -229,7 +267,7 @@ model PriceCalculation {
   @@map("price_calculations")
 }
 
-/// Global minimum fiyat ayarı — singleton tablo
+/// Global minimum fiyat ayarÄ± â€” singleton tablo
 model GlobalPriceSetting {
   id         String   @id @default(uuid()) @db.Uuid
   minPrice   Decimal  @db.Decimal(12, 2)
@@ -240,7 +278,20 @@ model GlobalPriceSetting {
   @@map("global_price_settings")
 }
 
-/// Kategori eşleştirme — tedarikçi kategorisini pazaryeri kategorisine bağlar
+/// Pazaryeri stok/fiyat otomatik guncelleme ayarlari
+model MarketplaceSyncSetting {
+  id           String      @id @default(uuid()) @db.Uuid
+  marketplace  Marketplace @unique
+  enabled      Boolean     @default(false)
+  mode         String      @default("stock-price") @db.VarChar(20)
+  scheduleTime String      @default("03:00") @db.VarChar(5)
+  limit        Int         @default(1000)
+  lastRunAt    DateTime?   @db.Timestamptz
+  updatedAt    DateTime    @updatedAt @db.Timestamptz
+
+  @@map("marketplace_sync_settings")
+}
+/// Kategori eÅŸleÅŸtirme â€” tedarikÃ§i kategorisini pazaryeri kategorisine baÄŸlar
 model CategoryMapping {
   id                      String                @id @default(uuid()) @db.Uuid
   sourceId                String                @db.Uuid
@@ -264,7 +315,7 @@ model CategoryMapping {
   @@map("category_mappings")
 }
 
-/// Pazaryeri kategori ağacı önbelleği
+/// Pazaryeri kategori aÄŸacÄ± Ã¶nbelleÄŸi
 model MarketplaceCategory {
   id             String      @id @default(uuid()) @db.Uuid
   marketplace    Marketplace
@@ -278,7 +329,7 @@ model MarketplaceCategory {
   @@unique([marketplace, categoryId])
   @@map("marketplace_categories")
 }
-// ─── SİPARİŞ ENUM'LARI ───────────────────────────────────────────────────────
+// â”€â”€â”€ SÄ°PARÄ°Å ENUM'LARI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 enum OrderStatus {
   NEW
@@ -316,22 +367,22 @@ enum CargoCompany {
   @@map("cargo_company")
 }
 
-// ─── SİPARİŞ TABLOLARI ───────────────────────────────────────────────────────
+// â”€â”€â”€ SÄ°PARÄ°Å TABLOLARI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Siparişler — tüm pazaryerlerinden çekilen siparişler
+/// SipariÅŸler â€” tÃ¼m pazaryerlerinden Ã§ekilen sipariÅŸler
 model Order {
   id                  String      @id @default(uuid()) @db.Uuid
   marketplace         Marketplace
   marketplaceOrderId  String      @unique @db.VarChar(100)
   marketplaceOrderNo  String?     @db.VarChar(100)
   status              OrderStatus @default(NEW)
-  /// AES-256-GCM şifreli — KVKK
+  /// AES-256-GCM ÅŸifreli â€” KVKK
   customerName        String?     @db.VarChar(200)
-  /// AES-256-GCM şifreli — KVKK
+  /// AES-256-GCM ÅŸifreli â€” KVKK
   customerPhone       String?     @db.VarChar(20)
-  /// AES-256-GCM şifreli — KVKK
+  /// AES-256-GCM ÅŸifreli â€” KVKK
   shippingAddress     Json?
-  /// AES-256-GCM şifreli — KVKK
+  /// AES-256-GCM ÅŸifreli â€” KVKK
   billingAddress      Json?
   totalAmount         Decimal     @db.Decimal(12, 2)
   currency            String      @default("TRY") @db.VarChar(3)
@@ -345,7 +396,7 @@ model Order {
   createdAt           DateTime    @default(now()) @db.Timestamptz
   updatedAt           DateTime    @updatedAt @db.Timestamptz
 
-  // İlişkiler
+  // Ä°liÅŸkiler
   items               OrderItem[]
   statusLogs          OrderStatusLog[]
   invoice             Invoice?
@@ -355,24 +406,31 @@ model Order {
   @@map("orders")
 }
 
-/// Sipariş kalemleri
+/// SipariÅŸ kalemleri
 model OrderItem {
   id                    String   @id @default(uuid()) @db.Uuid
   orderId               String   @db.Uuid
   order                 Order    @relation(fields: [orderId], references: [id])
   productId             String?  @db.Uuid
+  sourceId              String?  @db.Uuid
+  source                XmlSource? @relation(fields: [sourceId], references: [id])
   marketplaceProductId  String?  @db.VarChar(100)
   sku                   String?  @db.VarChar(100)
   title                 String   @db.VarChar(500)
   quantity              Int
   unitPrice             Decimal  @db.Decimal(12, 2)
   totalPrice            Decimal  @db.Decimal(12, 2)
+  shippingFee           Decimal  @default(0) @db.Decimal(12, 2)
+  serviceFee            Decimal  @default(0) @db.Decimal(12, 2)
+  extraFees             Decimal  @default(0) @db.Decimal(12, 2)
   vatRate               Int?
 
+  @@index([sourceId])
+  @@index([productId])
   @@map("order_items")
 }
 
-/// Sipariş durum geçiş logları
+/// SipariÅŸ durum geÃ§iÅŸ loglarÄ±
 model OrderStatusLog {
   id          String   @id @default(uuid()) @db.Uuid
   orderId     String   @db.Uuid
@@ -402,9 +460,9 @@ model Invoice {
   @@map("invoices")
 }
 
-// ─── KARGO TABLOLARI ─────────────────────────────────────────────────────────
+// â”€â”€â”€ KARGO TABLOLARI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Kargo gönderileri
+/// Kargo gÃ¶nderileri
 model Shipment {
   id                      String      @id @default(uuid()) @db.Uuid
   orderId                 String      @unique @db.Uuid
@@ -427,7 +485,7 @@ model Shipment {
   @@map("shipments")
 }
 
-/// Kargo firması — pazaryeri kod eşleştirmesi
+/// Kargo firmasÄ± â€” pazaryeri kod eÅŸleÅŸtirmesi
 model CargoCompanyMapping {
   id                    String      @id @default(uuid()) @db.Uuid
   cargoCompany          CargoCompany
@@ -468,7 +526,7 @@ model OrderFetchLog {
 
   @@map("order_fetch_logs")
 }
-// ─── ENUM'LAR ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€ ENUM'LAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 enum AttributeType {
   dropdown
@@ -492,9 +550,9 @@ enum PublishStatus {
   @@map("publish_status")
 }
 
-// ─── TABLOLAR ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€ TABLOLAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Pazaryeri kategori özellik önbelleği
+/// Pazaryeri kategori Ã¶zellik Ã¶nbelleÄŸi
 model MarketplaceCategoryAttribute {
   id               String        @id @default(uuid()) @db.Uuid
   marketplace      Marketplace
@@ -514,7 +572,7 @@ model MarketplaceCategoryAttribute {
   @@map("marketplace_category_attributes")
 }
 
-/// Ürün özellik değerleri
+/// ÃœrÃ¼n Ã¶zellik deÄŸerleri
 model ProductAttribute {
   id            String   @id @default(uuid()) @db.Uuid
   productId     String   @db.Uuid
@@ -533,7 +591,7 @@ model ProductAttribute {
   @@map("product_attributes")
 }
 
-/// Ürün gönderim iş takibi
+/// ÃœrÃ¼n gÃ¶nderim iÅŸ takibi
 model ProductPublishJob {
   id            String        @id @default(uuid()) @db.Uuid
   productId     String        @db.Uuid

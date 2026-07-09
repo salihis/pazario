@@ -1,6 +1,7 @@
 // src/validators/ProductValidator.ts
 
 import type { ParsedProduct } from '../parser/XMLParser'
+import { MARKETPLACE_BRAND_NAME, marketplaceBarcode } from '../services/MarketplacePayloadTransform'
 
 // ─── INTERFACE'LER ────────────────────────────────────────────────────────────
 
@@ -32,7 +33,7 @@ const RULES: Record<string, MarketplaceRules> = {
     minPrice: 0.01,
     minImages: 1,
     maxImages: 8,
-    barcodePattern: /^[0-9]{8,13}$/,
+    barcodePattern: /^([0-9]{8,13}|BRS[a-zA-Z0-9\-_]{1,50})$/,
   },
   HEPSIBURADA: {
     required: ['title', 'sku', 'price', 'stock', 'images', 'category'],
@@ -59,7 +60,7 @@ const RULES: Record<string, MarketplaceRules> = {
     minPrice: 0.01,
     minImages: 1,
     maxImages: 10,
-    barcodePattern: /^[0-9]{8,14}$/,
+    barcodePattern: /^([0-9]{8,14}|BRS[a-zA-Z0-9\-_]{1,50})$/,
   },
 }
 
@@ -68,6 +69,7 @@ const RULES: Record<string, MarketplaceRules> = {
 const HTML_TAG_REGEX = /<[^>]+>/g
 const ONLY_PUNCTUATION_REGEX = /^[^a-zA-Z0-9\u00C0-\u024F]+$/
 const MAX_PRICE_WARNING = 1_000_000
+export const MIN_MARKETPLACE_STOCK = 6
 
 // ─── VALIDATOR SINIFI ─────────────────────────────────────────────────────────
 
@@ -90,7 +92,11 @@ export class ProductValidatorImpl {
 
     // ── Required field validation ──────────────────────────────────────────────
     for (const field of rules.required) {
-      const val = product[field]
+      const val = field === 'barcode'
+        ? marketplaceBarcode(product.barcode, product.sku)
+        : field === 'brand'
+          ? product.brand || MARKETPLACE_BRAND_NAME
+          : product[field]
       if (
         val === null ||
         val === undefined ||
@@ -150,14 +156,15 @@ export class ProductValidatorImpl {
     }
 
     // ── Stock validation ───────────────────────────────────────────────────────
-    if (product.stock === 0) {
-      warnings.push('Stock is 0 - product will be listed as inactive')
+    if (product.stock <= MIN_MARKETPLACE_STOCK) {
+      errors.push(`Insufficient stock: ${product.stock} (must be > ${MIN_MARKETPLACE_STOCK})`)
     }
 
     // ── Barcode format validation ──────────────────────────────────────────────
-    if (rules.barcodePattern && product.barcode) {
-      if (!rules.barcodePattern.test(product.barcode)) {
-        errors.push(`Invalid barcode format: ${product.barcode}`)
+    const effectiveBarcode = marketplaceBarcode(product.barcode, product.sku)
+    if (rules.barcodePattern && effectiveBarcode) {
+      if (!rules.barcodePattern.test(effectiveBarcode)) {
+        errors.push(`Invalid barcode format: ${effectiveBarcode}`)
       }
     }
 

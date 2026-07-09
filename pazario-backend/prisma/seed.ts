@@ -2,11 +2,13 @@
 
 import { PrismaClient, CargoCompany, Marketplace } from '@prisma/client'
 import bcrypt from 'bcrypt'
+import pino from 'pino'
 
 const prisma = new PrismaClient()
+const logger = pino({ level: 'info' })
 
 async function main() {
-  console.log('🌱 Seed başlatılıyor...')
+  logger.info('Seed başlatılıyor...')
 
   // ─── 1. Global Minimum Fiyat ─────────────────────────────────────────────
   try {
@@ -20,33 +22,33 @@ async function main() {
         updatedBy: 'seed',
       },
     })
-    console.log('✅ GlobalPriceSetting oluşturuldu')
+    logger.info('GlobalPriceSetting oluşturuldu')
   } catch (e) {
-    console.error('❌ GlobalPriceSetting hatası:', e)
+    logger.error({ err: e }, 'GlobalPriceSetting hatası')
   }
 
   // ─── 2. Kargo Firma — Pazaryeri Eşleştirmeleri (4×4 = 16 satır) ──────────
   const cargoMappings = [
     // Aras Kargo
-    { cargoCompany: CargoCompany.ARAS, marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'ARAS',       marketplaceCargoName: 'Aras Kargo' },
-    { cargoCompany: CargoCompany.ARAS, marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'ArasKargo',  marketplaceCargoName: 'Aras Kargo' },
-    { cargoCompany: CargoCompany.ARAS, marketplace: Marketplace.N11,         marketplaceCargoCode: '10',         marketplaceCargoName: 'Aras Kargo' },
-    { cargoCompany: CargoCompany.ARAS, marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'ARAS',       marketplaceCargoName: 'Aras Kargo' },
+    { cargoCompany: CargoCompany.ARAS,    marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'ARAS',       marketplaceCargoName: 'Aras Kargo' },
+    { cargoCompany: CargoCompany.ARAS,    marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'ArasKargo',  marketplaceCargoName: 'Aras Kargo' },
+    { cargoCompany: CargoCompany.ARAS,    marketplace: Marketplace.N11,         marketplaceCargoCode: '10',         marketplaceCargoName: 'Aras Kargo' },
+    { cargoCompany: CargoCompany.ARAS,    marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'ARAS',       marketplaceCargoName: 'Aras Kargo' },
     // Yurtiçi Kargo
     { cargoCompany: CargoCompany.YURTICI, marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'YURTICI',      marketplaceCargoName: 'Yurtiçi Kargo' },
     { cargoCompany: CargoCompany.YURTICI, marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'YurticiKargo', marketplaceCargoName: 'Yurtiçi Kargo' },
     { cargoCompany: CargoCompany.YURTICI, marketplace: Marketplace.N11,         marketplaceCargoCode: '12',           marketplaceCargoName: 'Yurtiçi Kargo' },
     { cargoCompany: CargoCompany.YURTICI, marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'YK',           marketplaceCargoName: 'Yurtiçi Kargo' },
     // Sürat Kargo
-    { cargoCompany: CargoCompany.SURAT, marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'SURAT',      marketplaceCargoName: 'Sürat Kargo' },
-    { cargoCompany: CargoCompany.SURAT, marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'SuratKargo', marketplaceCargoName: 'Sürat Kargo' },
-    { cargoCompany: CargoCompany.SURAT, marketplace: Marketplace.N11,         marketplaceCargoCode: '6',          marketplaceCargoName: 'Sürat Kargo' },
-    { cargoCompany: CargoCompany.SURAT, marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'SURAT',      marketplaceCargoName: 'Sürat Kargo' },
+    { cargoCompany: CargoCompany.SURAT,   marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'SURAT',      marketplaceCargoName: 'Sürat Kargo' },
+    { cargoCompany: CargoCompany.SURAT,   marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'SuratKargo', marketplaceCargoName: 'Sürat Kargo' },
+    { cargoCompany: CargoCompany.SURAT,   marketplace: Marketplace.N11,         marketplaceCargoCode: '6',          marketplaceCargoName: 'Sürat Kargo' },
+    { cargoCompany: CargoCompany.SURAT,   marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'SURAT',      marketplaceCargoName: 'Sürat Kargo' },
     // PTT Kargo
-    { cargoCompany: CargoCompany.PTT, marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'PTT',      marketplaceCargoName: 'PTT Kargo' },
-    { cargoCompany: CargoCompany.PTT, marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'PttKargo', marketplaceCargoName: 'PTT Kargo' },
-    { cargoCompany: CargoCompany.PTT, marketplace: Marketplace.N11,         marketplaceCargoCode: '8',        marketplaceCargoName: 'PTT Kargo' },
-    { cargoCompany: CargoCompany.PTT, marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'PTT',      marketplaceCargoName: 'PTT Kargo' },
+    { cargoCompany: CargoCompany.PTT,     marketplace: Marketplace.TRENDYOL,    marketplaceCargoCode: 'PTT',      marketplaceCargoName: 'PTT Kargo' },
+    { cargoCompany: CargoCompany.PTT,     marketplace: Marketplace.HEPSIBURADA, marketplaceCargoCode: 'PttKargo', marketplaceCargoName: 'PTT Kargo' },
+    { cargoCompany: CargoCompany.PTT,     marketplace: Marketplace.N11,         marketplaceCargoCode: '8',        marketplaceCargoName: 'PTT Kargo' },
+    { cargoCompany: CargoCompany.PTT,     marketplace: Marketplace.PAZARAMA,    marketplaceCargoCode: 'PTT',      marketplaceCargoName: 'PTT Kargo' },
   ]
 
   try {
@@ -62,9 +64,9 @@ async function main() {
         create: mapping,
       })
     }
-    console.log('✅ CargoCompanyMappings oluşturuldu (16 satır)')
+    logger.info('CargoCompanyMappings oluşturuldu (16 satır)')
   } catch (e) {
-    console.error('❌ CargoCompanyMappings hatası:', e)
+    logger.error({ err: e }, 'CargoCompanyMappings hatası')
   }
 
   // ─── 3. Super Admin Kullanıcı ─────────────────────────────────────────────
@@ -80,9 +82,9 @@ async function main() {
         role: 'SUPER_ADMIN',
       },
     })
-    console.log('✅ Super Admin kullanıcı oluşturuldu')
+    logger.info('Super Admin kullanıcı oluşturuldu')
   } catch (e) {
-    console.error('❌ User hatası:', e)
+    logger.error({ err: e }, 'User hatası')
   }
 
   // ─── 4. Örnek XML Kaynağı ─────────────────────────────────────────────────
@@ -98,21 +100,19 @@ async function main() {
         active: false, // gerçek URL ile aktifleştirilmeli
       },
     })
-    console.log('✅ Örnek XmlSource oluşturuldu')
+    logger.info('Örnek XmlSource oluşturuldu')
   } catch (e) {
-    console.error('❌ XmlSource hatası:', e)
+    logger.error({ err: e }, 'XmlSource hatası')
   }
 
-  console.log('🎉 Seed tamamlandı!')
-}
-// ─── 5. Test Ürünleri ─────────────────────────────────────────────────────
+  // ─── 5. Test Ürünleri ─────────────────────────────────────────────────────
   try {
     const source = await prisma.xmlSource.findFirst()
     if (source) {
       const testProducts = [
-        { externalId: 'TEST001', sku: 'SKU-001', title: 'Test Urun 1 - Telefon Kilifi', brand: 'TestMarka', price: 129.99, stock: 50 },
-        { externalId: 'TEST002', sku: 'SKU-002', title: 'Test Urun 2 - Sarj Kablosu', brand: 'TestMarka', price: 89.90, stock: 100 },
-        { externalId: 'TEST003', sku: 'SKU-003', title: 'Test Urun 3 - Powerbank', brand: 'ElektroMarka', price: 459.00, stock: 0 },
+        { externalId: 'TEST001', sku: 'SKU-001', title: 'Test Urun 1 - Telefon Kilifi', brand: 'TestMarka',    price: 129.99, stock: 50 },
+        { externalId: 'TEST002', sku: 'SKU-002', title: 'Test Urun 2 - Sarj Kablosu',   brand: 'TestMarka',    price: 89.90,  stock: 100 },
+        { externalId: 'TEST003', sku: 'SKU-003', title: 'Test Urun 3 - Powerbank',       brand: 'ElektroMarka', price: 459.00, stock: 0 },
       ]
       for (const p of testProducts) {
         await prisma.product.upsert({
@@ -133,15 +133,18 @@ async function main() {
           },
         })
       }
-      console.log('Test urunleri eklendi')
+      logger.info('Test ürünleri eklendi (3 adet)')
     }
   } catch (e) {
-    console.error('Test urun hatasi:', e)
+    logger.error({ err: e }, 'Test ürün hatası')
   }
 
+  logger.info('Seed tamamlandı')
+}
+
 main()
-  .catch(e => {
-    console.error('💥 Seed başarısız:', e)
+  .catch((e) => {
+    logger.error({ err: e }, 'Seed başarısız')
     process.exit(1)
   })
   .finally(async () => {

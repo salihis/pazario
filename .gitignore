@@ -9,6 +9,7 @@
 .env.production
 .env.development
 .env.test
+.env.deploy
 *.pem
 *.key
 *.crt
@@ -109,3 +110,5 @@ generated/
 !GITHUB_SECRETS_SETUP.sh
 
 # ═══════════════════════════════════════════════════════════════════
+imports/*.xml
+!imports/.gitkeep

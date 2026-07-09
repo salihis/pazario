@@ -1,36 +1,48 @@
+// src/api/middleware/auth.middleware.ts
+
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
+import { env } from '../../config/env'
+import { logger } from '../../utils/logger'
 
-interface AuthRequest extends Request {
-  user?: {
-    id: string
-    email: string
-    role: string
-  }
+interface JwtPayload {
+  id: string
+  email: string
+  role: string
 }
 
-export const requireAuth = (req: AuthRequest, res: Response, next: NextFunction) => {
+export interface AuthRequest extends Request {
+  user?: JwtPayload
+}
+
+/**
+ * JWT Bearer token'ı RS256 algoritmasıyla doğrular.
+ * Geçersiz veya süresi dolmuş token'da 401 döndürür.
+ */
+export const requireAuth = (req: AuthRequest, res: Response, next: NextFunction): void => {
   try {
     const authHeader = req.headers.authorization
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Authorization header missing or invalid' })
+      res.status(401).json({ error: 'Authorization header missing or invalid' })
+      return
     }
 
-    const token = authHeader.substring(7) // Remove 'Bearer ' prefix
+    const token = authHeader.substring(7)
 
-    // Verify JWT token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret') as any
+    const decoded = jwt.verify(token, env.JWT_PUBLIC_KEY, {
+      algorithms: ['RS256'],
+    }) as JwtPayload
 
     req.user = {
       id: decoded.id,
       email: decoded.email,
-      role: decoded.role
+      role: decoded.role,
     }
 
     next()
   } catch (error) {
-    console.error('Auth middleware error:', error)
+    logger.warn({ err: error }, 'JWT doğrulama hatası')
     res.status(401).json({ error: 'Invalid or expired token' })
   }
 }

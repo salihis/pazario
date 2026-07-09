@@ -58,6 +58,15 @@ export interface PriceCalculationResult {
 
 const ROUND_FACTOR = 100 // 2 ondalık basamak için
 
+export function roundUpToNinetyNine(price: number): number {
+  const wholePart = Math.floor(price)
+  const lowerCandidate = wholePart + 0.99
+  if (price <= lowerCandidate + 1e-9) {
+    return Number(lowerCandidate.toFixed(2))
+  }
+  return Number((wholePart + 1.99).toFixed(2))
+}
+
 // ─── FİYAT MOTORU ────────────────────────────────────────────────────────────
 
 export class PriceEngine {
@@ -75,7 +84,7 @@ export class PriceEngine {
     }
 
     // ── 1. Uygun kuralı bul (first-match-wins, priority ASC) ─────────────
-    const rule = await this.findRule(marketplace, productId, brand, category)
+    const rule = await this.findRule(marketplace, productId, basePrice, brand, category)
     if (!rule) {
       throw new PriceRuleNotFoundError(marketplace, productId)
     }
@@ -98,7 +107,8 @@ export class PriceEngine {
     const ara2Kar = ara1BaseEk * karOrani
     const ara3Kargo = ara2Kar + kargo
     const rawPrice = ara3Kargo / (1 - komisyonOrani)
-    let finalPrice = Math.round(rawPrice * ROUND_FACTOR) / ROUND_FACTOR
+    const roundedRawPrice = Math.round(rawPrice * ROUND_FACTOR) / ROUND_FACTOR
+    let finalPrice = roundUpToNinetyNine(roundedRawPrice)
 
     if (finalPrice <= 0) {
       throw new PriceCalculationError(`Hesaplanan fiyat sıfır veya negatif: ${finalPrice}`)
@@ -109,9 +119,11 @@ export class PriceEngine {
     const globalSetting = await this.prisma.globalPriceSetting.findFirst()
     if (globalSetting) {
       const minPrice = Number(globalSetting.minPrice)
-      if (finalPrice < minPrice) {
-        finalPrice = minPrice
+      if (roundedRawPrice < minPrice) {
         minPriceApplied = true
+      }
+      if (finalPrice < minPrice) {
+        finalPrice = roundUpToNinetyNine(minPrice)
       }
     }
 
@@ -126,7 +138,7 @@ export class PriceEngine {
       ara1BaseEk,
       ara2Kar,
       ara3Kargo,
-      rawPrice: Math.round(rawPrice * ROUND_FACTOR) / ROUND_FACTOR,
+      rawPrice: roundedRawPrice,
       minPriceApplied,
       finalPrice,
     }
@@ -187,6 +199,7 @@ export class PriceEngine {
   private async findRule(
     marketplace: string,
     productId: string,
+    basePrice: number,
     brand?: string,
     category?: string
   ) {
@@ -202,15 +215,25 @@ export class PriceEngine {
       orderBy: { priority: 'asc' },
     })
 
+    const matchesRange = (rule: { priceStart: unknown; priceEnd: unknown }) => {
+      const start = rule.priceStart === null ? null : Number(rule.priceStart)
+      const end = rule.priceEnd === null ? null : Number(rule.priceEnd)
+      if (start !== null && basePrice < start) return false
+      if (end !== null && basePrice >= end) return false
+      return true
+    }
+
+    const scopedRules = rules.filter(matchesRange)
+
     // PRODUCT scope
-    const productRule = rules.find(
+    const productRule = scopedRules.find(
       r => r.scopeType === 'PRODUCT' && r.scopeValue === productId
     )
     if (productRule) return productRule
 
     // BRAND scope
     if (brand) {
-      const brandRule = rules.find(
+      const brandRule = scopedRules.find(
         r => r.scopeType === 'BRAND' && r.scopeValue === brand
       )
       if (brandRule) return brandRule
@@ -218,7 +241,7 @@ export class PriceEngine {
 
     // CATEGORY scope (LIKE '%value%')
     if (category) {
-      const categoryRule = rules.find(
+      const categoryRule = scopedRules.find(
         r => r.scopeType === 'CATEGORY' &&
           r.scopeValue &&
           category.includes(r.scopeValue)
@@ -227,13 +250,13 @@ export class PriceEngine {
     }
 
     // MARKETPLACE scope
-    const marketplaceRule = rules.find(
+    const marketplaceRule = scopedRules.find(
       r => r.scopeType === 'MARKETPLACE' && r.marketplace === marketplace
     )
     if (marketplaceRule) return marketplaceRule
 
     // GLOBAL scope
-    const globalRule = rules.find(r => r.scopeType === 'GLOBAL')
+    const globalRule = scopedRules.find(r => r.scopeType === 'GLOBAL')
     return globalRule ?? null
   }
 

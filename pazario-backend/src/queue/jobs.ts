@@ -11,7 +11,9 @@ export interface SyncJobData {
 export interface PublishJobData {
   productId: string
   marketplace: Marketplace
-  syncJobId: string
+  publishJobId?: string
+  syncJobId?: string
+  force?: boolean
 }
 
 export interface CargoJobData {

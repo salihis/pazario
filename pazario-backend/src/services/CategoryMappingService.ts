@@ -15,6 +15,37 @@ export class CategoryAIError extends Error {
 
 export type Marketplace = 'TRENDYOL' | 'HEPSIBURADA' | 'N11' | 'PAZARAMA'
 
+export async function findApprovedCategoryMapping(
+  prisma: PrismaClient,
+  params: { sourceId: string | null; sourceCategory: string | null; marketplace: Marketplace }
+) {
+  const sourceCategory = params.sourceCategory ?? ''
+  if (!sourceCategory) return null
+
+  if (params.sourceId) {
+    const sourceSpecific = await prisma.categoryMapping.findFirst({
+      where: {
+        sourceId: params.sourceId,
+        sourceCategory,
+        marketplace: params.marketplace,
+        status: 'APPROVED',
+        marketplaceCategoryId: { not: null },
+      },
+    })
+    if (sourceSpecific) return sourceSpecific
+  }
+
+  return prisma.categoryMapping.findFirst({
+    where: {
+      sourceCategory,
+      marketplace: params.marketplace,
+      status: 'APPROVED',
+      marketplaceCategoryId: { not: null },
+    },
+    orderBy: { updatedAt: 'desc' },
+  })
+}
+
 export interface AISuggestion {
   categoryId: string
   categoryPath: string

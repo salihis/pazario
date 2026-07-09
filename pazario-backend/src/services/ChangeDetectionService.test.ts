@@ -1,22 +1,50 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ChangeDetectionService } from '../services/ChangeDetectionService'
-import { ParsedProduct } from '../parser/XMLParser'
+import type { ParsedProduct } from '../parser/XMLParser'
+import type { PrismaClient } from '@prisma/client'
 
-// Mock Prisma
+// ─── MOCK ────────────────────────────────────────────────────────────────────
+
+type TxClient = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>
+
 const mockPrisma = {
   product: {
     findMany: vi.fn(),
     createMany: vi.fn(),
     update: vi.fn(),
-    updateMany: vi.fn()
+    updateMany: vi.fn(),
   },
-  $transaction: vi.fn(async (cb: any) => {
+  $transaction: vi.fn(async (cb: (tx: TxClient) => Promise<unknown>) => {
     if (typeof cb === 'function') {
-      return await cb(mockPrisma)
+      return await cb(mockPrisma as unknown as TxClient)
     }
     return []
-  })
-} as any
+  }),
+} as unknown as PrismaClient
+
+// ─── YARDIMCI ────────────────────────────────────────────────────────────────
+
+function makeProduct(overrides: Partial<ParsedProduct> = {}): ParsedProduct {
+  return {
+    id: 'prod1',
+    sku: 'SKU1',
+    barcode: null,
+    title: 'Test Product',
+    description: 'Description',
+    brand: 'Brand',
+    category: 'Category',
+    price: 99.99,
+    listPrice: null,
+    currency: 'TRY',
+    stock: 10,
+    images: ['https://example.com/image.jpg'],
+    attributes: {},
+    contentHash: 'hash1',
+    ...overrides,
+  }
+}
+
+// ─── TESTLER ─────────────────────────────────────────────────────────────────
 
 describe('ChangeDetectionService', () => {
   let service: ChangeDetectionService
@@ -26,150 +54,91 @@ describe('ChangeDetectionService', () => {
     service = new ChangeDetectionService(mockPrisma)
   })
 
-  describe('detect', () => {
+  describe('detect()', () => {
     it('should detect new products', async () => {
-      const incomingProducts: ParsedProduct[] = [
-        {
-          id: 'new123',
-          sku: 'NEW123',
-          barcode: null,
-          title: 'New Product',
-          description: 'Description',
-          brand: 'Brand',
-          category: 'Category',
-          price: 99.99,
-          listPrice: null,
-          currency: 'TRY',
-          stock: 10,
-          images: ['https://example.com/image.jpg'],
-          attributes: {},
-          contentHash: 'hash123'
-        }
-      ]
+      const incoming = [makeProduct({ id: 'new123', contentHash: 'hash123' })]
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([])
 
-      mockPrisma.product.findMany.mockResolvedValue([])
-
-      const result = await service.detect('source1', incomingProducts)
+      const result = await service.detect('source1', incoming)
 
       expect(result.newProducts).toHaveLength(1)
       expect(result.changedProducts).toHaveLength(0)
       expect(result.unchangedIds).toHaveLength(0)
     })
 
-    it('should detect changed products', async () => {
-      const incomingProducts: ParsedProduct[] = [
-        {
-          id: 'existing123',
-          sku: 'EXISTING123',
-          barcode: null,
-          title: 'Updated Product',
-          description: 'Updated',
-          brand: 'Brand',
-          category: 'Category',
-          price: 199.99,
-          listPrice: null,
-          currency: 'TRY',
-          stock: 10,
-          images: ['https://example.com/image.jpg'],
-          attributes: {},
-          contentHash: 'newhash'
-        }
-      ]
-
-      mockPrisma.product.findMany.mockResolvedValue([
-        {
-          id: 'prod123',
-          externalId: 'existing123',
-          contentHash: 'oldhash'
-        }
+    it('should detect changed products when hash differs', async () => {
+      const incoming = [makeProduct({ id: 'existing123', contentHash: 'newhash' })]
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'prod123', externalId: 'existing123', contentHash: 'oldhash' },
       ])
 
-      const result = await service.detect('source1', incomingProducts)
+      const result = await service.detect('source1', incoming)
 
       expect(result.changedProducts).toHaveLength(1)
       expect(result.changedProducts[0].existingId).toBe('prod123')
+      expect(result.newProducts).toHaveLength(0)
     })
 
-    it('should detect unchanged products', async () => {
-      const incomingProducts: ParsedProduct[] = [
-        {
-          id: 'existing123',
-          sku: 'EXISTING123',
-          barcode: null,
-          title: 'Same Product',
-          description: 'Same',
-          brand: 'Brand',
-          category: 'Category',
-          price: 99.99,
-          listPrice: null,
-          currency: 'TRY',
-          stock: 10,
-          images: ['https://example.com/image.jpg'],
-          attributes: {},
-          contentHash: 'samehash'
-        }
-      ]
-
-      mockPrisma.product.findMany.mockResolvedValue([
-        {
-          id: 'prod123',
-          externalId: 'existing123',
-          contentHash: 'samehash'
-        }
+    it('should detect unchanged products when hash is same', async () => {
+      const incoming = [makeProduct({ id: 'existing123', contentHash: 'samehash' })]
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'prod123', externalId: 'existing123', contentHash: 'samehash' },
       ])
 
-      const result = await service.detect('source1', incomingProducts)
+      const result = await service.detect('source1', incoming)
 
       expect(result.unchangedIds).toHaveLength(1)
       expect(result.unchangedIds[0]).toBe('prod123')
+      expect(result.newProducts).toHaveLength(0)
+      expect(result.changedProducts).toHaveLength(0)
     })
 
-    it('should handle large batch (1000 products)', async () => {
-      const incomingProducts: ParsedProduct[] = Array(1000)
-        .fill(null)
-        .map((_, i) => ({
-          id: `prod${i}`,
-          sku: `SKU${i}`,
-          barcode: null,
-          title: `Product ${i}`,
-          description: `Desc ${i}`,
-          brand: 'Brand',
-          category: 'Category',
-          price: 99.99,
-          listPrice: null,
-          currency: 'TRY',
-          stock: 10,
-          images: ['https://example.com/image.jpg'],
-          attributes: {},
-          contentHash: `hash${i}`
-        }))
+    it('should detect deleted products (in DB but not in XML)', async () => {
+      // XML'de sadece prod1 var, DB'de prod1 + prod2 var
+      const incoming = [makeProduct({ id: 'prod1', contentHash: 'hash1' })]
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'db-id-1', externalId: 'prod1', contentHash: 'hash1' },
+        { id: 'db-id-2', externalId: 'prod2', contentHash: 'hash2' }, // XML'de yok
+      ])
 
-      mockPrisma.product.findMany.mockResolvedValue([])
+      const result = await service.detect('source1', incoming)
 
-      const result = await service.detect('source1', incomingProducts)
+      expect(result.deletedExternalIds).toHaveLength(1)
+      expect(result.deletedExternalIds[0]).toBe('prod2')
+      // Mevcut ürün sadece DEĞİŞMEMİŞ olmalı
+      expect(result.unchangedIds).toHaveLength(1)
+    })
+
+    it('should process large batch (1000 products) in under 2 seconds', async () => {
+      const incoming = Array.from({ length: 1000 }, (_, i) =>
+        makeProduct({ id: `prod${i}`, contentHash: `hash${i}` })
+      )
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([])
+
+      const start = Date.now()
+      const result = await service.detect('source1', incoming)
+      const elapsed = Date.now() - start
 
       expect(result.newProducts).toHaveLength(1000)
+      expect(elapsed).toBeLessThan(2000)
     })
   })
 
-  describe('applyChanges', () => {
-    it('should handle detection results', async () => {
-      const result = {
-        newProducts: [],
+  describe('applyChanges()', () => {
+    it('should return created and updated counts', async () => {
+      ;(mockPrisma.product.createMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 })
+
+      const detectionResult = {
+        newProducts: [makeProduct({ id: 'n1' }), makeProduct({ id: 'n2' })],
         changedProducts: [],
         unchangedIds: [],
-        deletedExternalIds: []
+        deletedExternalIds: [],
       }
 
-      mockPrisma.$transaction.mockResolvedValue({
-        created: 0,
-        updated: 0,
-        unchanged: 0
-      })
+      const stats = await service.applyChanges('source1', detectionResult, 'job123')
 
-      const stats = await service.applyChanges('source1', result, 'job123')
-
-      expect(stats).toBeDefined()
+      expect(stats.created).toBe(2)
+      expect(stats.updated).toBe(0)
     })
   })
 })

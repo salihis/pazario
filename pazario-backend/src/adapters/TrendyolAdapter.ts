@@ -1,32 +1,101 @@
-// src/adapters/TrendyolAdapter.ts
+import { BaseAdapter, Product, PublishResult } from './BaseAdapter'
+import { transformMarketplaceProduct } from '../services/MarketplacePayloadTransform'
 
-import { BaseAdapter, Product, PublishResult, AdapterConfig } from './BaseAdapter'
-import { logger } from '../utils/logger'
-
-interface TrendyolAuthResponse {
-  accessToken: string
-  tokenType: string
-  expiresIn: number
+interface TrendyolBatchResponse {
+  batchRequestId?: string
+  id?: string
 }
 
-interface TrendyolProduct {
-  productId: string
-  title: string
-  description: string
-  price: number
-  currencyCode: string
-  stockCode: string
-  stockQuantity: number
-  barcode: string
-  images: Array<{ url: string; rank: number }>
-  categoryId: number
-  brandId: number
+export interface TrendyolBatchResult {
+  batchRequestId: string
+  status: string
+  items?: Array<{
+    status?: string
+    failureReasons?: string[]
+  }>
+  failedItemCount?: number
+}
+
+interface TrendyolImage {
+  url: string
+}
+
+interface TrendyolAttribute {
+  attributeId: string | number
+  attributeValueId?: string | number
+  customAttributeValue?: string
+}
+
+type TrendyolPublishProduct = Product & {
+  categoryId?: string | number
+  marketplaceAttributes?: TrendyolAttribute[]
+}
+
+function buildTrendyolProductPayload(product: TrendyolPublishProduct, includeStockAndPrice: boolean) {
+  const publishProduct = transformMarketplaceProduct(product)
+  const categoryId = Number(product.categoryId ?? product.category)
+  if (!Number.isFinite(categoryId) || categoryId <= 0) {
+    return {
+      error: 'Onayli kategori eslesmesinde marketplaceCategoryId sayisal olmali.',
+      payload: null,
+    }
+  }
+
+  const brandId = requiredNumberEnv('TY_BRAND_ID')
+  const cargoCompanyId = requiredNumberEnv('TY_CARGO_COMPANY_ID')
+  const dimensionalWeight = Number(process.env.TY_DIMENSIONAL_WEIGHT || '1')
+  const vatRate = Number(process.env.TY_VAT_RATE || '20')
+  const stockCode = publishProduct.sku || publishProduct.id
+  const productMainId = publishProduct.productMainId || stockCode
+  const images: TrendyolImage[] = publishProduct.images.slice(0, 8).map(url => ({ url }))
+  const item = {
+    barcode: publishProduct.barcode,
+    title: publishProduct.title.slice(0, 100),
+    productMainId,
+    brandId,
+    categoryId,
+    stockCode,
+    dimensionalWeight,
+    description: publishProduct.description || publishProduct.title,
+    currencyType: 'TRY',
+    vatRate,
+    cargoCompanyId,
+    images,
+    attributes: (product.marketplaceAttributes ?? []).map(attr => ({
+      attributeId: Number(attr.attributeId),
+      attributeValueId: attr.attributeValueId ? Number(attr.attributeValueId) : undefined,
+      customAttributeValue: attr.customAttributeValue,
+    })).filter(attr => Number.isFinite(attr.attributeId) && (
+      attr.attributeValueId === undefined || Number.isFinite(attr.attributeValueId)
+    )),
+    ...(includeStockAndPrice ? {
+      quantity: publishProduct.stock,
+      listPrice: publishProduct.price,
+      salePrice: publishProduct.price,
+    } : {}),
+  }
+
+  return { error: null, payload: { items: [item] } }
+}
+
+function extractAxiosMessage(error: unknown): string {
+  if (error instanceof Error) {
+    const axiosErr = error as Error & { response?: { data?: unknown } }
+    const data = axiosErr.response?.data
+    return typeof data === 'string' ? data : data ? JSON.stringify(data) : error.message
+  }
+  return String(error)
+}
+
+function requiredNumberEnv(name: string): number {
+  const value = Number(process.env[name])
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} .env icinde tanimli olmali`)
+  }
+  return value
 }
 
 export class TrendyolAdapter extends BaseAdapter {
-  private accessToken: string = ''
-  private tokenExpiresAt: number = 0
-
   constructor(
     private apiKey: string,
     private apiSecret: string,
@@ -34,169 +103,120 @@ export class TrendyolAdapter extends BaseAdapter {
   ) {
     super(
       {
-        apiKey: apiKey,
-        apiSecret: apiSecret,
-        baseUrl: 'https://api.trendyol.com/sapigw',
-        timeout: 30000
+        apiKey,
+        apiSecret,
+        baseUrl: 'https://apigw.trendyol.com/integration/product',
+        timeout: 30000,
       },
       'TRENDYOL'
     )
   }
 
   async authenticate(): Promise<void> {
-    if (this.accessToken && Date.now() < this.tokenExpiresAt) {
-      return // Token still valid
-    }
-
-    try {
-      const response = await this.client.post<TrendyolAuthResponse>('/v2/oauth/authorize', {
-        apiKey: this.apiKey,
-        apiSecret: this.apiSecret
-      })
-
-      this.accessToken = response.data.accessToken
-      this.tokenExpiresAt = Date.now() + response.data.expiresIn * 1000
-
-      this.client.defaults.headers.common['Authorization'] = `Bearer ${this.accessToken}`
-      logger.info('Trendyol authentication successful')
-    } catch (error) {
-      throw new Error(`Trendyol authentication failed: ${error}`)
-    }
+    const token = Buffer.from(`${this.apiKey}:${this.apiSecret}`).toString('base64')
+    this.client.defaults.headers.common.Authorization = `Basic ${token}`
+    this.client.defaults.headers.common['User-Agent'] = `${this.supplierId} - SelfIntegration`
   }
 
-  async publishProduct(product: Product): Promise<PublishResult> {
+  async publishProduct(product: TrendyolPublishProduct): Promise<PublishResult> {
     return this.retry(async () => {
       await this.authenticate()
 
-      const payload = {
-        productTitle: product.title,
-        productDescription: product.description,
-        productCode: product.sku,
-        barcode: product.barcode,
-        salePrice: product.price,
-        currencyCode: 'TRY',
-        stockCode: `${this.supplierId}-${product.id}`,
-        quantity: product.stock,
-        categoryId: 12345, // Map from product.category (example)
-        images: product.images.map((url, idx) => ({
-          url,
-          rank: idx
-        }))
-      }
-
-      try {
-        const response = await this.client.post('/v2/products', payload)
-
-        return {
-          success: true,
-          listingId: response.data.id,
-          productId: product.id,
-          message: 'Product published to Trendyol'
-        }
-      } catch (error: any) {
+      const { payload, error } = buildTrendyolProductPayload(product, true)
+      if (!payload) {
         return {
           success: false,
           productId: product.id,
-          message: 'Failed to publish product to Trendyol',
-          errors: [error?.response?.data?.message || error?.message]
+          message: 'Trendyol kategori ID eksik',
+          errors: [error ?? 'Kategori ID eksik'],
         }
       }
-    })
+
+      try {
+        const response = await this.client.post<TrendyolBatchResponse>(
+          `/sellers/${this.supplierId}/v2/products`,
+          payload
+        )
+        const batchRequestId = response.data?.batchRequestId ?? response.data?.id
+        return {
+          success: Boolean(batchRequestId),
+          listingId: batchRequestId,
+          productId: product.id,
+          message: batchRequestId
+            ? `Trendyol batch olusturuldu: ${batchRequestId}`
+            : 'Trendyol batch cevabinda id yok',
+        }
+      } catch (error: unknown) {
+        return {
+          success: false,
+          productId: product.id,
+          message: 'Trendyol urun gonderimi basarisiz',
+          errors: [extractAxiosMessage(error)],
+        }
+      }
+    }, 1)
+  }
+
+  async updateProduct(product: TrendyolPublishProduct): Promise<PublishResult> {
+    return this.retry(async () => {
+      await this.authenticate()
+
+      const { payload, error } = buildTrendyolProductPayload(product, false)
+      if (!payload) {
+        return {
+          success: false,
+          productId: product.id,
+          message: 'Trendyol kategori ID eksik',
+          errors: [error ?? 'Kategori ID eksik'],
+        }
+      }
+
+      try {
+        const response = await this.client.put<TrendyolBatchResponse>(
+          `/sellers/${this.supplierId}/products`,
+          payload
+        )
+        const batchRequestId = response.data?.batchRequestId ?? response.data?.id
+        return {
+          success: Boolean(batchRequestId),
+          listingId: batchRequestId,
+          productId: product.id,
+          message: batchRequestId
+            ? `Trendyol updateProduct batch olusturuldu: ${batchRequestId}`
+            : 'Trendyol updateProduct cevabinda id yok',
+        }
+      } catch (error: unknown) {
+        return {
+          success: false,
+          productId: product.id,
+          message: 'Trendyol urun bilgisi guncelleme basarisiz',
+          errors: [extractAxiosMessage(error)],
+        }
+      }
+    }, 1)
   }
 
   async getProduct(productId: string): Promise<Product> {
-    return this.retry(async () => {
-      await this.authenticate()
+    throw new Error(`Trendyol getProduct henuz bu adapterde kullanilmiyor: ${productId}`)
+  }
 
-      const response = await this.client.get<TrendyolProduct>(`/v2/products/${productId}`)
-      const data = response.data
-
-      return {
-        id: data.productId,
-        title: data.title,
-        description: data.description,
-        price: data.price,
-        stock: data.stockQuantity,
-        sku: data.stockCode,
-        barcode: data.barcode,
-        images: data.images.map(img => img.url),
-        category: data.categoryId.toString(),
-        brand: data.brandId.toString()
-      }
-    })
+  async getBatchRequestResult(batchRequestId: string): Promise<TrendyolBatchResult> {
+    await this.authenticate()
+    const response = await this.client.get<TrendyolBatchResult>(
+      `/sellers/${this.supplierId}/products/batch-requests/${batchRequestId}`
+    )
+    return response.data
   }
 
   async updatePrice(productId: string, price: number): Promise<PublishResult> {
-    return this.retry(async () => {
-      await this.authenticate()
-
-      try {
-        await this.client.put(`/v2/products/${productId}/price`, {
-          salePrice: price,
-          currencyCode: 'TRY'
-        })
-
-        return {
-          success: true,
-          productId,
-          message: 'Price updated on Trendyol'
-        }
-      } catch (error: any) {
-        return {
-          success: false,
-          productId,
-          message: 'Failed to update price',
-          errors: [error?.message]
-        }
-      }
-    })
+    return { success: false, productId, message: `Trendyol fiyat guncelleme bu adapterde ayri servisle yapiliyor: ${price}` }
   }
 
   async updateStock(productId: string, stock: number): Promise<PublishResult> {
-    return this.retry(async () => {
-      await this.authenticate()
-
-      try {
-        await this.client.put(`/v2/products/${productId}/stock`, {
-          quantity: stock
-        })
-
-        return {
-          success: true,
-          productId,
-          message: 'Stock updated on Trendyol'
-        }
-      } catch (error: any) {
-        return {
-          success: false,
-          productId,
-          message: 'Failed to update stock',
-          errors: [error?.message]
-        }
-      }
-    })
+    return { success: false, productId, message: `Trendyol stok guncelleme bu adapterde ayri servisle yapiliyor: ${stock}` }
   }
 
   async deleteProduct(productId: string): Promise<PublishResult> {
-    return this.retry(async () => {
-      await this.authenticate()
-
-      try {
-        await this.client.delete(`/v2/products/${productId}`)
-
-        return {
-          success: true,
-          productId,
-          message: 'Product deleted from Trendyol'
-        }
-      } catch (error: any) {
-        return {
-          success: false,
-          productId,
-          message: 'Failed to delete product',
-          errors: [error?.message]
-        }
-      }
-    })
+    return { success: false, productId, message: 'Trendyol urun silme bu adapterde etkin degil' }
   }
 }

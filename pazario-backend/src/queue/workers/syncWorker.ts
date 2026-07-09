@@ -3,7 +3,7 @@
 import { Worker } from 'bullmq'
 import { PrismaClient } from '@prisma/client'
 import { redis } from '../../utils/redis'
-import { publishQueue, notifyQueue } from '../queues'
+import { publishQueue, notifyQueue, syncQueue } from '../queues'
 import type { SyncJobData } from '../jobs'
 
 const prisma = new PrismaClient()
@@ -14,6 +14,23 @@ export const syncWorker = new Worker<SyncJobData>(
   async (job) => {
     const { sourceId, triggeredBy } = job.data
     const startedAt = new Date()
+
+    if (sourceId === 'all') {
+      const sources = await prisma.xmlSource.findMany({
+        where: { active: true, autoSyncEnabled: true },
+        select: { id: true },
+      })
+
+      for (const source of sources) {
+        await syncQueue.add('sync', {
+          sourceId: source.id,
+          triggeredBy,
+        })
+      }
+
+      await job.updateProgress(100)
+      return { enqueued: sources.length }
+    }
 
     // sync_jobs kaydını RUNNING yap
     const syncJob = await prisma.syncJob.create({
@@ -89,6 +106,9 @@ export const syncWorker = new Worker<SyncJobData>(
   },
   {
     connection: redis,
+    lockDuration: 10 * 60 * 1000,
+    stalledInterval: 60 * 1000,
+    maxStalledCount: 2,
     concurrency: 1, // aynı anda sadece bir sync
   }
 )

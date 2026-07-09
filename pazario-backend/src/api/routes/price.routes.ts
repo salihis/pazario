@@ -18,21 +18,22 @@ import { validateBody } from '../middleware/validate'
 
 const router = Router()
 
-// Fiyat kuralları
+// ─── KURAL YÖNETİMİ ──────────────────────────────────────────────────────────
 router.get('/price-rules', getRules)
 router.post('/price-rules', validateBody(createRuleSchema), createRule)
 router.put('/price-rules/:ruleId', updateRule)
 router.delete('/price-rules/:ruleId', deleteRule)
 
-// Simülasyon ve önizleme
+// ─── SİMÜLASYON & ÖNİZLEME ──────────────────────────────────────────────────
 router.post('/price-rules/simulate', validateBody(simulateSchema), simulatePrice)
 router.get('/price-rules/preview/:productId', previewProductPrice)
 
-// Global ayarlar
+// ─── GLOBAL AYARLAR ──────────────────────────────────────────────────────────
 router.get('/price-settings', getSettings)
 router.put('/price-settings', updateSettings)
 
-// Audit log
+// ─── AUDİT LOG ───────────────────────────────────────────────────────────────
 router.get('/price-calculations', getCalculations)
 
 export default router
+

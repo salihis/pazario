@@ -2,7 +2,10 @@
 
 import { PrismaClient } from '@prisma/client'
 import { CategoryAttributeService } from './CategoryAttributeService'
-import { notifyQueue } from '../queue/queues'
+import { findApprovedCategoryMapping } from './CategoryMappingService'
+import { applyXmlColorSizeOverrides } from './XmlAttributeOverrideService'
+import { notifyQueue, publishQueue } from '../queue/queues'
+import { MIN_MARKETPLACE_STOCK } from '../validators/ProductValidator'
 
 // ─── INTERFACE'LER ────────────────────────────────────────────────────────────
 
@@ -46,7 +49,8 @@ export class PublishService {
   async submitProducts(
     productIds: string[],
     marketplace: Marketplace,
-    triggeredBy: string
+    triggeredBy: string,
+    options: { force?: boolean } = {}
   ): Promise<SubmitResult> {
     const skipped: { productId: string; reason: string }[] = []
     const jobIds: string[] = []
@@ -64,14 +68,28 @@ export class PublishService {
           continue
         }
 
+        if (product.stock <= MIN_MARKETPLACE_STOCK) {
+          skipped.push({
+            productId,
+            reason: `Stok yetersiz: ${product.stock} (stok > ${MIN_MARKETPLACE_STOCK} olmali)`,
+          })
+          continue
+        }
+
+        const existingListing = await this.prisma.marketplaceListing.findUnique({
+          where: { productId_marketplace: { productId, marketplace } },
+          select: { status: true, hashAtPublish: true },
+        })
+        if (!options.force && existingListing?.status === 'PUBLISHED' && existingListing.hashAtPublish === product.contentHash) {
+          skipped.push({ productId, reason: 'Urun bu pazaryerinde zaten guncel olarak yayinda' })
+          continue
+        }
+
         // Kategori ID'sini bul
-        const categoryMapping = await this.prisma.categoryMapping.findFirst({
-          where: {
-            sourceId: product.sourceId,
-            sourceCategory: product.categoryRaw ?? '',
-            marketplace,
-            status: 'APPROVED',
-          },
+        const categoryMapping = await findApprovedCategoryMapping(this.prisma, {
+          sourceId: product.sourceId,
+          sourceCategory: product.categoryRaw,
+          marketplace,
         })
 
         if (!categoryMapping?.marketplaceCategoryId) {
@@ -80,6 +98,8 @@ export class PublishService {
         }
 
         // Zorunlu attribute kontrolü
+        await applyXmlColorSizeOverrides(this.prisma, product, marketplace, categoryMapping.marketplaceCategoryId)
+
         const { attributes } = await this.attrService.getAttributes(
           marketplace,
           categoryMapping.marketplaceCategoryId,
@@ -113,7 +133,12 @@ export class PublishService {
         submitted++
 
         // Polling kuyruğuna al
-        await this.schedulePolling(job.id, marketplace)
+        await publishQueue.add(`publish-${job.id}`, {
+          productId,
+          marketplace,
+          publishJobId: job.id,
+          force: Boolean(options.force),
+        }, { priority: 1 })
       } catch (e) {
         skipped.push({
           productId,
@@ -154,18 +179,16 @@ export class PublishService {
     }
 
     try {
-      // Pazarama: tek seferlik kontrol
+      // Pazarama sonucu worker/adaptor tarafinda batch sonucuyla kontrol edilir.
       if (job.marketplace === 'PAZARAMA') {
         await this.prisma.productPublishJob.update({
           where: { id: jobId },
           data: {
-            status: 'SUCCESS',
-            resolvedAt: new Date(),
+            status: job.externalJobId ? 'POLLING' : 'SUBMITTED',
             attemptCount: { increment: 1 },
             lastPolledAt: new Date(),
           },
         })
-        await this.updateListing(job.productId, job.marketplace as Marketplace, 'PUBLISHED', job.product.contentHash)
         return
       }
 
@@ -233,13 +256,10 @@ export class PublishService {
       })
       if (!product) continue
 
-      const categoryMapping = await this.prisma.categoryMapping.findFirst({
-        where: {
-          sourceId: product.sourceId,
-          sourceCategory: product.categoryRaw ?? '',
-          marketplace,
-          status: 'APPROVED',
-        },
+      const categoryMapping = await findApprovedCategoryMapping(this.prisma, {
+        sourceId: product.sourceId,
+        sourceCategory: product.categoryRaw,
+        marketplace,
       })
 
       if (!categoryMapping?.marketplaceCategoryId) {

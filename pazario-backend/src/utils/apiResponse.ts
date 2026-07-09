@@ -1,6 +1,8 @@
 // src/utils/apiResponse.ts
 
-export interface ApiResponse<T = any> {
+import { ErrorRequestHandler } from 'express'
+
+export interface ApiResponse<T = unknown> {
   success: boolean
   data?: T
   error?: string
@@ -22,14 +24,16 @@ export interface ApiErrorResponse {
 }
 
 export class ApiResponseBuilder {
-  static success<T>(data: T, message?: string): ApiResponse<T> {
+  /** Başarılı yanıt oluşturur */
+  static success<T>(data: T): ApiResponse<T> {
     return {
       success: true,
       data,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     }
   }
 
+  /** Hata yanıtı oluşturur */
   static error(
     error: string,
     code: string = 'INTERNAL_ERROR',
@@ -40,7 +44,7 @@ export class ApiResponseBuilder {
       error,
       code,
       details,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     }
   }
 
@@ -66,23 +70,21 @@ export class ApiResponseBuilder {
       error: 'Validation failed',
       code: 'VALIDATION_ERROR',
       details,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     }
   }
 }
 
-// Global error handler middleware
-export const errorHandler = (
-  err: any,
-  req: any,
-  res: any,
-  next: any
-) => {
-  const status = err.status || err.statusCode || 500
-  const message = err.message || 'Internal Server Error'
-  const code = err.code || 'INTERNAL_ERROR'
+/** Global Express hata handler middleware */
+export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  const status: number =
+    typeof err.status === 'number'
+      ? err.status
+      : typeof err.statusCode === 'number'
+        ? err.statusCode
+        : 500
+  const message: string = typeof err.message === 'string' ? err.message : 'Internal Server Error'
+  const code: string = typeof err.code === 'string' ? err.code : 'INTERNAL_ERROR'
 
-  const response = ApiResponseBuilder.error(message, code)
-
-  res.status(status).json(response)
+  res.status(status).json(ApiResponseBuilder.error(message, code))
 }

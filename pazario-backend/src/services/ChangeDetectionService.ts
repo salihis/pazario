@@ -1,9 +1,9 @@
-// src/services/ChangeDetectionService.ts
+﻿// src/services/ChangeDetectionService.ts
 
 import { PrismaClient } from '@prisma/client'
 import type { ParsedProduct } from '../parser/XMLParser'
 
-// ─── HATA SINIFI ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ HATA SINIFI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export class ChangeDetectionError extends Error {
   constructor(message: string, public readonly cause?: unknown) {
@@ -12,7 +12,7 @@ export class ChangeDetectionError extends Error {
   }
 }
 
-// ─── INTERFACE'LER ────────────────────────────────────────────────────────────
+// â”€â”€â”€ INTERFACE'LER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export interface ChangeDetectionResult {
   newProducts: ParsedProduct[]
@@ -21,40 +21,68 @@ export interface ChangeDetectionResult {
   deletedExternalIds: string[]
 }
 
-// ─── SABİTLER ─────────────────────────────────────────────────────────────────
+// â”€â”€â”€ SABÄ°TLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const BATCH_SIZE = 500
 
-// ─── SERVİS ───────────────────────────────────────────────────────────────────
+function parseCategoryIncludeKeywords(value: string | null | undefined): string[] {
+  return (value ?? '')
+    .split(/[,\n;]/)
+    .map(item => normalizeCategoryFilterText(item.trim()))
+    .filter(Boolean)
+}
+
+function normalizeCategoryFilterText(value: string): string {
+  return value
+    .replace(/&amp;/gi, '&')
+    .toLocaleLowerCase('tr-TR')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ı/g, 'i')
+}
+
+function categoryMatchesFilter(category: string | null | undefined, keywords: string | null | undefined): boolean {
+  const terms = parseCategoryIncludeKeywords(keywords)
+  if (terms.length === 0) return true
+  const normalizedCategory = normalizeCategoryFilterText(category ?? '')
+  return terms.some(term => normalizedCategory.includes(term))
+}
+
+// â”€â”€â”€ SERVÄ°S â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export class ChangeDetectionService {
   constructor(private readonly prisma: PrismaClient) {}
 
   /**
-   * Gelen ürünleri DB'deki mevcut ürünlerle karşılaştırır
-   * Tek sorguda tüm hash'leri çeker — N+1 sorgu yok
+   * Gelen Ã¼rÃ¼nleri DB'deki mevcut Ã¼rÃ¼nlerle karÅŸÄ±laÅŸtÄ±rÄ±r
+   * Tek sorguda tÃ¼m hash'leri Ã§eker â€” N+1 sorgu yok
    */
   async detect(
     sourceId: string,
-    incomingProducts: ParsedProduct[]
+    incomingProducts: ParsedProduct[],
+    options: { categoryIncludeKeywords?: string | null } = {}
   ): Promise<ChangeDetectionResult> {
     try {
-      // ── 1. DB'den tüm hash'leri tek sorguda çek ──────────────────────────
+      // â”€â”€ 1. DB'den tÃ¼m hash'leri tek sorguda Ã§ek â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       const existingRows = await this.prisma.product.findMany({
         where: { sourceId },
         select: {
           id: true,
           externalId: true,
           contentHash: true,
+          categoryRaw: true,
         },
       })
-
-      // externalId → { id, contentHash } map'i
-      const existingMap = new Map<string, { id: string; contentHash: string }>(
-        existingRows.map(r => [r.externalId, { id: r.id, contentHash: r.contentHash }])
+      const existingRowsInScope = existingRows.filter(row =>
+        categoryMatchesFilter(row.categoryRaw, options.categoryIncludeKeywords)
       )
 
-      // ── 2. Gelen ürünleri sınıflandır ────────────────────────────────────
+      // externalId â†’ { id, contentHash } map'i
+      const existingMap = new Map<string, { id: string; contentHash: string }>(
+        existingRowsInScope.map(r => [r.externalId, { id: r.id, contentHash: r.contentHash }])
+      )
+
+      // â”€â”€ 2. Gelen Ã¼rÃ¼nleri sÄ±nÄ±flandÄ±r â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       const newProducts: ParsedProduct[] = []
       const changedProducts: Array<{ product: ParsedProduct; existingId: string }> = []
       const unchangedIds: string[] = []
@@ -65,23 +93,23 @@ export class ChangeDetectionService {
         const existing = existingMap.get(product.id)
 
         if (!existing) {
-          // DB'de yok → YENİ
+          // DB'de yok â†’ YENÄ°
           newProducts.push(product)
         } else if (existing.contentHash !== product.contentHash) {
-          // Hash farklı → DEĞİŞMİŞ
+          // Hash farklÄ± â†’ DEÄÄ°ÅMÄ°Å
           changedProducts.push({ product, existingId: existing.id })
         } else {
-          // Hash aynı → DEĞİŞMEMİŞ
+          // Hash aynÄ± â†’ DEÄÄ°ÅMEMÄ°Å
           unchangedIds.push(existing.id)
         }
       }
 
-      // ── 3. DB'de var ama XML'de yok → SİLİNMİŞ ──────────────────────────
-      const deletedExternalIds = existingRows
+      // â”€â”€ 3. DB'de var ama XML'de yok â†’ SÄ°LÄ°NMÄ°Å â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      const deletedExternalIds = existingRowsInScope
         .filter(r => !seenExternalIds.has(r.externalId))
         .map(r => r.externalId)
 
-      // ── 4. Değişmeyenlerin lastSeenAt'ini batch güncelle ─────────────────
+      // â”€â”€ 4. DeÄŸiÅŸmeyenlerin lastSeenAt'ini batch gÃ¼ncelle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       await this.updateLastSeenBatch(unchangedIds)
 
       return {
@@ -92,15 +120,15 @@ export class ChangeDetectionService {
       }
     } catch (e) {
       throw new ChangeDetectionError(
-        `Değişim tespiti başarısız: ${e instanceof Error ? e.message : String(e)}`,
+        `DeÄŸiÅŸim tespiti baÅŸarÄ±sÄ±z: ${e instanceof Error ? e.message : String(e)}`,
         e
       )
     }
   }
 
   /**
-   * Değişmeyen ürünlerin lastSeenAt alanını batch olarak günceller
-   * Batch size: 500 (yapılandırılabilir)
+   * DeÄŸiÅŸmeyen Ã¼rÃ¼nlerin lastSeenAt alanÄ±nÄ± batch olarak gÃ¼nceller
+   * Batch size: 500 (yapÄ±landÄ±rÄ±labilir)
    */
   private async updateLastSeenBatch(productIds: string[]): Promise<void> {
     if (productIds.length === 0) return
@@ -117,8 +145,8 @@ export class ChangeDetectionService {
   }
 
   /**
-   * Yeni ve değişen ürünleri DB'ye batch upsert ile yazar
-   * Prisma transaction içinde çalışır
+   * Yeni ve deÄŸiÅŸen Ã¼rÃ¼nleri DB'ye batch upsert ile yazar
+   * Prisma transaction iÃ§inde Ã§alÄ±ÅŸÄ±r
    */
   async applyChanges(
     sourceId: string,
@@ -130,70 +158,86 @@ export class ChangeDetectionService {
 
     const now = new Date()
 
-    // ── Yeni ürünler — batch createMany ──────────────────────────────────
+    // â”€â”€ Yeni Ã¼rÃ¼nler â€” createMany ile batch insert â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const newChunks = this.chunkArray(result.newProducts, BATCH_SIZE)
     for (const chunk of newChunks) {
-      await this.prisma.$transaction(async (tx) => {
-        for (const product of chunk) {
-          await tx.product.create({
-            data: {
-              sourceId,
-              externalId: product.id,
-              sku: product.sku,
-              barcode: product.barcode,
-              title: product.title,
-              description: product.description,
-              brand: product.brand,
-              categoryRaw: product.category,
-              price: product.price,
-              listPrice: product.listPrice,
-              currency: product.currency,
-              stock: product.stock,
-              images: product.images,
-              attributes: product.attributes,
-              contentHash: product.contentHash,
-              lastSeenAt: now,
-            },
-          })
-          created++
-        }
+      const insertResult = await this.prisma.product.createMany({
+        data: chunk.map((product) => ({
+          sourceId,
+          externalId: product.id,
+          sku: product.sku,
+          barcode: product.barcode,
+          title: product.title,
+          description: product.description,
+          brand: product.brand,
+          categoryRaw: product.category,
+          price: product.price,
+          listPrice: product.listPrice,
+          currency: product.currency,
+          stock: product.stock,
+          images: product.images,
+          attributes: product.attributes,
+          contentHash: product.contentHash,
+          lastSeenAt: now,
+        })),
+        skipDuplicates: true,
       })
+      created += insertResult.count
     }
 
-    // ── Değişen ürünler — batch updateMany ───────────────────────────────
+    // â”€â”€ DeÄŸiÅŸen Ã¼rÃ¼nler â€” batch updateMany â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const changedChunks = this.chunkArray(result.changedProducts, BATCH_SIZE)
     for (const chunk of changedChunks) {
-      await this.prisma.$transaction(async (tx) => {
-        for (const { product, existingId } of chunk) {
-          await tx.product.update({
-            where: { id: existingId },
-            data: {
-              sku: product.sku,
-              barcode: product.barcode,
-              title: product.title,
-              description: product.description,
-              brand: product.brand,
-              categoryRaw: product.category,
-              price: product.price,
-              listPrice: product.listPrice,
-              currency: product.currency,
-              stock: product.stock,
-              images: product.images,
-              attributes: product.attributes,
-              contentHash: product.contentHash,
-              lastSeenAt: now,
-            },
-          })
-          updated++
-        }
+      await this.prisma.$transaction(
+        async (tx) => {
+          for (const { product, existingId } of chunk) {
+            await tx.product.update({
+              where: { id: existingId },
+              data: {
+                sku: product.sku,
+                barcode: product.barcode,
+                title: product.title,
+                description: product.description,
+                brand: product.brand,
+                categoryRaw: product.category,
+                price: product.price,
+                listPrice: product.listPrice,
+                currency: product.currency,
+                stock: product.stock,
+                images: product.images,
+                attributes: product.attributes,
+                contentHash: product.contentHash,
+                lastSeenAt: now,
+              },
+            })
+            updated++
+          }
+        },
+        { maxWait: 10000, timeout: 60000 }
+      )
+    }
+
+    const deletedChunks = this.chunkArray(result.deletedExternalIds, BATCH_SIZE)
+    for (const chunk of deletedChunks) {
+      const updateResult = await this.prisma.product.updateMany({
+        where: {
+          sourceId,
+          externalId: { in: chunk },
+          stock: { not: 0 },
+        },
+        data: {
+          stock: 0,
+          lastSeenAt: now,
+        },
       })
+      updated += updateResult.count
     }
 
     return { created, updated }
   }
 
   /**
-   * Array'i belirli boyutta parçalara böler
+   * Array'i belirli boyutta parÃ§alara bÃ¶ler
    */
   private chunkArray<T>(arr: T[], size: number): T[][] {
     const chunks: T[][] = []
@@ -203,3 +247,4 @@ export class ChangeDetectionService {
     return chunks
   }
 }
+

@@ -4,6 +4,7 @@ import { Worker } from 'bullmq'
 import { PrismaClient } from '@prisma/client'
 import { redis } from '../../utils/redis'
 import { notifyQueue } from '../queues'
+import { logger } from '../../utils/logger'
 import type { CargoJobData } from '../jobs'
 
 const prisma = new PrismaClient()
@@ -42,9 +43,13 @@ export const cargoWorker = new Worker<CargoJobData>(
 )
 
 cargoWorker.on('failed', async (job, err) => {
-  await notifyQueue.add('cargo-failed', {
-    type: 'slack',
-    message: `❌ Kargo işlemi başarısız: ${job?.data.orderId} / ${job?.data.action} — ${err.message}`,
-    level: 'error',
-  }).catch(() => {})
+  await notifyQueue
+    .add('cargo-failed', {
+      type: 'slack',
+      message: `❌ Kargo işlemi başarısız: ${job?.data.orderId} / ${job?.data.action} — ${err.message}`,
+      level: 'error',
+    })
+    .catch((notifyErr: unknown) => {
+      logger.error({ err: notifyErr }, 'notifyQueue.add hatası (cargo-failed)')
+    })
 })

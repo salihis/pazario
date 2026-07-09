@@ -2,18 +2,19 @@
 import { Outlet, NavLink } from 'react-router-dom'
 
 const navItems = [
-  { to: '/dashboard', label: '📊 Dashboard' },
-  { to: '/products', label: '📦 Ürünler' },
-  { to: '/orders', label: '🛒 Siparişler' },
-  { to: '/price-engine', label: '💰 Fiyat Motoru' },
-  { to: '/categories', label: '🗂 Kategoriler' },
+  { to: '/dashboard', label: 'Dashboard' },
+  { to: '/products', label: 'Urunler' },
+  { to: '/orders', label: 'Siparisler' },
+  { to: '/finance', label: 'Finans' },
+  { to: '/price-engine', label: 'Fiyat Motoru' },
+  { to: '/categories', label: 'Kategoriler' },
+  { to: '/marketplaces', label: 'Pazaryerleri' },
   { to: '/sources', label: 'XML Kaynaklar' },
 ]
 
 export default function Layout() {
   return (
     <div className="flex h-screen bg-gray-950 text-gray-100">
-      {/* Sidebar */}
       <aside className="w-56 bg-gray-900 border-r border-gray-800 flex flex-col">
         <div className="p-4 border-b border-gray-800">
           <div className="flex items-center gap-2">
@@ -46,7 +47,6 @@ export default function Layout() {
         </div>
       </aside>
 
-      {/* Main */}
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>
