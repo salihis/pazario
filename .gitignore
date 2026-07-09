@@ -53,7 +53,7 @@ ehthumbs.db
 *.db
 *.sqlite
 *.sqlite3
-db/
+/db/
 postgres_data/
 redis_data/
 backups/
