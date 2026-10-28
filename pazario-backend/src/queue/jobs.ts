@@ -6,14 +6,18 @@ export interface SyncJobData {
   sourceId: string
   triggeredBy: 'cron' | 'manual'
   userId?: string
+  operationId?: string
 }
 
 export interface PublishJobData {
   productId: string
+  productIds?: string[]
   marketplace: Marketplace
   publishJobId?: string
+  publishJobIds?: string[]
   syncJobId?: string
   force?: boolean
+  operationId?: string
 }
 
 export interface CargoJobData {
@@ -23,6 +27,7 @@ export interface CargoJobData {
 
 export interface OrderFetchJobData {
   marketplace: Marketplace | 'all'
+  operationId?: string
 }
 
 export interface NotifyJobData {

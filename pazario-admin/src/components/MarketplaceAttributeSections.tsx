@@ -11,6 +11,7 @@ export type MarketplaceAttributeField = {
   values: AttributeValue[]
   currentValue: string | string[] | boolean | null
   validationError?: string | null
+  systemManaged?: boolean
 }
 
 interface MarketplaceAttributeSectionsProps {
@@ -19,6 +20,7 @@ interface MarketplaceAttributeSectionsProps {
   values: Record<string, string>
   onChange: (attributeId: string, value: string) => void
   emptyMessage?: string
+  mandatoryOnly?: boolean
 }
 
 function normalizeText(value: string) {
@@ -160,12 +162,23 @@ function renderField(
   value: string,
   onChange: (attributeId: string, nextValue: string) => void
 ) {
+  if (attr.systemManaged) {
+    return (
+      <input
+        value={value}
+        readOnly
+        aria-label={`${attr.attributeName} sistem tarafindan dolduruldu`}
+        className="w-full cursor-not-allowed bg-gray-950/60 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300"
+      />
+    )
+  }
+
   const hasMarketplaceValues = attr.values.length > 0
   const isSelectLike = attr.attributeType === 'dropdown'
     || attr.attributeType === 'multi_select'
     || attr.attributeType === 'color'
     || (isColorAttribute(attr) && hasMarketplaceValues)
-  const canFallbackToText = isColorAttribute(attr) && !hasMarketplaceValues
+  const canFallbackToText = isSelectLike && !hasMarketplaceValues && attr.allowCustomValue
 
   if (attr.attributeType === 'boolean') {
     return (
@@ -203,12 +216,12 @@ function renderField(
     )
   }
 
-  if (isColorAttribute(attr) && canFallbackToText) {
+  if (canFallbackToText) {
     return (
       <input
         value={value}
         onChange={e => onChange(attr.attributeId, e.target.value)}
-        placeholder={attr.isMandatory ? 'Renk girin' : 'Opsiyonel renk'}
+        placeholder={attr.isMandatory ? `${attr.attributeName} girin` : 'Opsiyonel'}
         className="w-full bg-gray-950 border border-gray-700 rounded-xl px-3 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
       />
     )
@@ -230,16 +243,19 @@ export default function MarketplaceAttributeSections({
   values,
   onChange,
   emptyMessage = 'Bu kategori icin ozellik bulunamadi.',
+  mandatoryOnly = false,
 }: MarketplaceAttributeSectionsProps) {
-  if (!attributes.length) {
+  const visibleAttributes = mandatoryOnly ? attributes.filter(attr => attr.isMandatory) : attributes
+
+  if (!visibleAttributes.length) {
     return (
       <div className="rounded-2xl border border-gray-800 bg-gray-950/70 px-4 py-5 text-sm text-gray-500">
-        {emptyMessage}
+        {mandatoryOnly ? 'Bu kategori icin zorunlu ozellik bulunamadi.' : emptyMessage}
       </div>
     )
   }
 
-  const ordered = attributes
+  const ordered = visibleAttributes
     .slice()
     .sort((a, b) => Number(b.isMandatory) - Number(a.isMandatory) || a.attributeName.localeCompare(b.attributeName, 'tr'))
 
@@ -286,7 +302,7 @@ export default function MarketplaceAttributeSections({
                       {attr.isMandatory && <span className="ml-1 text-red-400">*</span>}
                     </label>
                     <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${attr.isMandatory ? 'bg-red-900/40 text-red-200' : 'bg-gray-800 text-gray-300'}`}>
-                      {attr.attributeType}
+                      {attr.systemManaged ? 'otomatik' : attr.attributeType}
                     </span>
                   </div>
                   {renderField(attr, current, onChange)}

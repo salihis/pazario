@@ -19,6 +19,13 @@ interface CategoryMapping {
     reason: string
   }[] | null
   source: { id: string; name: string }
+  productCount: number
+  attributeSummary: {
+    mandatory: number
+    filled: number
+    missing: number
+    complete: boolean
+  }
 }
 
 interface CategoryStats {
@@ -56,6 +63,45 @@ interface AttributeSyncResult {
   synced: number
   failed: number
   attributes: number
+}
+
+interface AttributeRulePreview {
+  mappingId: string
+  marketplace: string
+  productCount: number
+  ruleCount: number
+  applicable: number
+  skippedExisting: number
+  skippedManual: number
+  applied?: number
+  suggestions: {
+    productId: string
+    sku: string
+    productTitle: string
+    ruleId: string
+    ruleName: string
+    attributeId: string
+    attributeName: string
+    valueId: string | null
+    valueText: string | null
+    confidence: number
+  }[]
+}
+
+type AttributeRuleMatchType = 'ALWAYS' | 'TITLE_CONTAINS' | 'BRAND_EQUALS' | 'XML_ATTRIBUTE_EQUALS'
+
+interface AttributeRule {
+  id: string
+  name: string
+  attributeId: string
+  attributeName: string | null
+  valueId: string | null
+  valueText: string | null
+  matchType: AttributeRuleMatchType
+  matchField: string | null
+  matchValue: string | null
+  confidence: number | string
+  isActive: boolean
 }
 
 interface ApiList<T> {
@@ -97,6 +143,14 @@ const toConfidence = (value: number | string | null) => {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+const displayCategoryText = (value: string) =>
+  value
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+
 export default function CategoryPage() {
   const queryClient = useQueryClient()
   const initialParams = new URLSearchParams(window.location.search)
@@ -111,6 +165,13 @@ export default function CategoryPage() {
   const [actionMessage, setActionMessage] = useState('')
   const [isEditingMapping, setIsEditingMapping] = useState(false)
   const [mappingAttributeValues, setMappingAttributeValues] = useState<Record<string, string>>({})
+  const [attributeFilter, setAttributeFilter] = useState<'all' | 'missing' | 'complete'>('all')
+  const [showMandatoryOnly, setShowMandatoryOnly] = useState(false)
+  const [attributeRulePreview, setAttributeRulePreview] = useState<AttributeRulePreview | null>(null)
+  const [conditionalAttributeId, setConditionalAttributeId] = useState('')
+  const [conditionalMatchType, setConditionalMatchType] = useState<Exclude<AttributeRuleMatchType, 'ALWAYS'>>('TITLE_CONTAINS')
+  const [conditionalMatchField, setConditionalMatchField] = useState('')
+  const [conditionalMatchValue, setConditionalMatchValue] = useState('')
 
   const resetList = () => {
     setPage(1)
@@ -150,6 +211,11 @@ export default function CategoryPage() {
   })
 
   const selected = data?.data.find(m => m.id === selectedId)
+  const visibleMappings = (data?.data ?? []).filter(mapping => {
+    if (attributeFilter === 'missing') return mapping.status === 'APPROVED' && mapping.attributeSummary.missing > 0
+    if (attributeFilter === 'complete') return mapping.status === 'APPROVED' && mapping.attributeSummary.complete
+    return true
+  })
   const activeMarketplace = selected?.marketplace || marketplace
   const selectedCategoryId = selected?.marketplaceCategoryId || ''
 
@@ -172,6 +238,19 @@ export default function CategoryPage() {
     retry: false,
     queryFn: () =>
       api.get(`/category-mappings/${selected?.id}/default-attributes`).then(r => r.data),
+  })
+
+  const { data: attributeRulesData } = useQuery<{ success: boolean; data: AttributeRule[] }>({
+    queryKey: ['attribute-rules', selected?.id],
+    enabled: Boolean(selected?.id && selected?.source?.id),
+    queryFn: () =>
+      api.get('/attribute-rules', {
+        params: {
+          marketplace: selected?.marketplace,
+          sourceId: selected?.source?.id,
+          sourceCategory: selected?.sourceCategory,
+        },
+      }).then(r => r.data),
   })
 
   const approveMutation = useMutation({
@@ -200,6 +279,10 @@ export default function CategoryPage() {
       nextValues[attr.attributeId] = String(attr.currentValue ?? '')
     }
     setMappingAttributeValues(nextValues)
+    setAttributeRulePreview(null)
+    setConditionalAttributeId('')
+    setConditionalMatchValue('')
+    setConditionalMatchField('')
   }, [selectedCategoryAttributesData])
 
   const selectedCategoryAttributeFields = selectedCategoryAttributesData?.attributes ?? []
@@ -222,15 +305,99 @@ export default function CategoryPage() {
 
       return api.put(`/category-mappings/${selected?.id}/default-attributes`, {
         attributes: payload,
+        saveAsRules: true,
+        applyNow: false,
       }).then(r => r.data)
     },
     onSuccess: result => {
       queryClient.invalidateQueries({ queryKey: ['category-mapping-default-attributes', selected?.id] })
-      setActionMessage(`${result.productCount} urun icin ${result.applied} kategori ozelligi uygulandi. ${result.skipped} manuel deger korunarak atlandi.`)
+      setAttributeRulePreview(null)
+      setActionMessage(`${result.rulesSaved} ozellik kurali kaydedildi. Uygulamadan once Kurallari Onizle ile sonucu kontrol edin.`)
     },
     onError: (error: any) => {
       const detail = error?.response?.data?.errors || error?.response?.data?.error || 'Kategori ozellikleri kaydedilemedi'
       setActionMessage(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    },
+  })
+
+  const previewAttributeRulesMutation = useMutation({
+    mutationFn: () =>
+      api.post(`/category-mappings/${selected?.id}/attribute-rules/preview`, {
+        overwrite: false,
+        minConfidence: 0.9,
+        limit: 2000,
+      }).then(r => r.data.data as AttributeRulePreview),
+    onSuccess: result => {
+      setAttributeRulePreview(result)
+      setActionMessage(`${result.productCount} urun tarandi; ${result.applicable} alan uygulanabilir. ${result.skippedManual} manuel ve ${result.skippedExisting} mevcut deger korunacak.`)
+    },
+    onError: (error: any) => {
+      setActionMessage(error?.response?.data?.error || 'Ozellik kurallari onizlenemedi')
+    },
+  })
+
+  const applyAttributeRulesMutation = useMutation({
+    mutationFn: () =>
+      api.post(`/category-mappings/${selected?.id}/attribute-rules/apply`, {
+        overwrite: false,
+        minConfidence: 0.9,
+        limit: 2000,
+      }).then(r => r.data.data as AttributeRulePreview),
+    onSuccess: result => {
+      setAttributeRulePreview(result)
+      queryClient.invalidateQueries({ queryKey: ['category-mapping-default-attributes', selected?.id] })
+      setActionMessage(`${result.applied ?? 0} ozellik degeri uygulandi. Manuel girilmis degerler korunmustur.`)
+    },
+    onError: (error: any) => {
+      setActionMessage(error?.response?.data?.error || 'Ozellik kurallari uygulanamadi')
+    },
+  })
+
+  const createConditionalRuleMutation = useMutation({
+    mutationFn: () => {
+      const attr = selectedCategoryAttributeFields.find(item => item.attributeId === conditionalAttributeId)
+      const value = (mappingAttributeValues[conditionalAttributeId] ?? '').trim()
+      if (!attr || !value || !selected) throw new Error('Ozellik ve uygulanacak deger secilmelidir')
+      const usesValueId = attr.attributeType === 'dropdown' || attr.attributeType === 'multi_select' || attr.attributeType === 'color'
+      return api.post('/attribute-rules', {
+        marketplace: selected.marketplace,
+        sourceId: selected.source.id,
+        sourceCategory: selected.sourceCategory,
+        marketplaceCategoryId: selected.marketplaceCategoryId,
+        name: `${attr.attributeName} - ${conditionalMatchValue}`,
+        attributeId: attr.attributeId,
+        attributeName: attr.attributeName,
+        valueId: usesValueId ? value : null,
+        valueText: usesValueId ? null : value,
+        matchType: conditionalMatchType,
+        matchField: conditionalMatchType === 'XML_ATTRIBUTE_EQUALS' ? conditionalMatchField.trim() : null,
+        matchValue: conditionalMatchValue.trim(),
+        confidence: 1,
+        priority: 200,
+        isActive: true,
+      }).then(r => r.data)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['attribute-rules', selected?.id] })
+      setAttributeRulePreview(null)
+      setConditionalMatchValue('')
+      setConditionalMatchField('')
+      setActionMessage('Kosullu ozellik kurali kaydedildi. Uygulamadan once onizleme yapin.')
+    },
+    onError: (error: any) => {
+      setActionMessage(error?.response?.data?.error || error?.message || 'Kosullu kural kaydedilemedi')
+    },
+  })
+
+  const deleteAttributeRuleMutation = useMutation({
+    mutationFn: (id: string) => api.delete(`/attribute-rules/${id}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['attribute-rules', selected?.id] })
+      setAttributeRulePreview(null)
+      setActionMessage('Ozellik kurali silindi.')
+    },
+    onError: (error: any) => {
+      setActionMessage(error?.response?.data?.error || 'Ozellik kurali silinemedi')
     },
   })
 
@@ -292,7 +459,8 @@ export default function CategoryPage() {
     onSuccess: result => {
       queryClient.invalidateQueries({ queryKey: ['category-mappings'] })
       queryClient.invalidateQueries({ queryKey: ['category-stats'] })
-      setActionMessage(`${result.scanned} bekleyen eslesme tarandi, ${result.updated} onerisi guncellendi.`)
+      const created = result.created ? `${result.created} eslesme olusturuldu, ` : ''
+      setActionMessage(`${created}${result.scanned} bekleyen eslesme tarandi, ${result.updated} onerisi guncellendi.`)
       resetList()
     },
     onError: (error: any) => {
@@ -490,7 +658,7 @@ export default function CategoryPage() {
 
         <button
           onClick={() => syncCategoriesMutation.mutate()}
-          disabled={syncCategoriesMutation.isPending || marketplace === 'HEPSIBURADA'}
+          disabled={syncCategoriesMutation.isPending}
           className="bg-sky-700 hover:bg-sky-600 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
         >
           {syncCategoriesMutation.isPending ? 'Kategori agaci aliniyor...' : 'Pazaryeri Kategorilerini Al'}
@@ -506,11 +674,29 @@ export default function CategoryPage() {
 
         <button
           onClick={() => syncAttributesMutation.mutate()}
-          disabled={syncAttributesMutation.isPending || marketplace === 'HEPSIBURADA'}
+          disabled={syncAttributesMutation.isPending}
           className="bg-emerald-700 hover:bg-emerald-600 text-white text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
         >
           {syncAttributesMutation.isPending ? 'Ozellikler aliniyor...' : 'Ozellikleri Al'}
         </button>
+
+        <div className="flex bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+          {[
+            { value: 'all', label: 'Tum Alan Durumlari' },
+            { value: 'missing', label: 'Zorunlu Eksik' },
+            { value: 'complete', label: 'Alanlari Tamam' },
+          ].map(tab => (
+            <button
+              key={tab.value}
+              onClick={() => setAttributeFilter(tab.value as 'all' | 'missing' | 'complete')}
+              className={`px-3 py-2 text-xs border-r border-gray-800 last:border-r-0 ${
+                attributeFilter === tab.value ? 'bg-gray-700 text-white' : 'text-gray-400 hover:bg-gray-800'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="grid grid-cols-[minmax(0,1fr)_420px] gap-4">
@@ -526,12 +712,13 @@ export default function CategoryPage() {
 
           {isLoading ? (
             <div className="p-8 text-center text-gray-500">Yukleniyor...</div>
-          ) : data?.data.length === 0 ? (
+          ) : visibleMappings.length === 0 ? (
             <div className="p-8 text-center text-gray-500">Bu filtrelerde kategori eslestirmesi yok</div>
           ) : (
             <div className="divide-y divide-gray-800">
-              {data?.data.map(mapping => {
+              {visibleMappings.map(mapping => {
                 const confidence = toConfidence(mapping.aiConfidence)
+                const attrSummary = mapping.attributeSummary
                 return (
                   <button
                     type="button"
@@ -547,7 +734,7 @@ export default function CategoryPage() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="text-sm text-gray-100 truncate">{mapping.sourceCategory}</div>
+                        <div className="text-sm text-gray-100 truncate">{displayCategoryText(mapping.sourceCategory)}</div>
                         <div className="text-xs text-gray-500 mt-1 truncate">
                           {mapping.source?.name} | {mapping.marketplace}
                         </div>
@@ -556,6 +743,20 @@ export default function CategoryPage() {
                             {mapping.marketplaceCategoryPath}
                           </div>
                         )}
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                          <span className="rounded-full border border-gray-700 bg-gray-950 px-2 py-0.5 text-gray-300">
+                            {mapping.productCount} urun
+                          </span>
+                          {mapping.status === 'APPROVED' && (
+                            <span className={`rounded-full border px-2 py-0.5 ${
+                              attrSummary.missing > 0
+                                ? 'border-red-800 bg-red-950/40 text-red-200'
+                                : 'border-green-800 bg-green-950/40 text-green-200'
+                            }`}>
+                              Zorunlu: {attrSummary.filled}/{attrSummary.mandatory}
+                            </span>
+                          )}
+                        </div>
                       </div>
                       <div className="flex items-center gap-2 flex-shrink-0">
                         {confidence !== null && (
@@ -585,7 +786,7 @@ export default function CategoryPage() {
           ) : (
             <div className="flex flex-col h-full">
               <div className="px-4 py-3 border-b border-gray-800">
-                <div className="text-sm font-bold text-gray-100 truncate">{selected.sourceCategory}</div>
+                <div className="text-sm font-bold text-gray-100 truncate">{displayCategoryText(selected.sourceCategory)}</div>
                 <div className="text-xs text-gray-500 mt-1">{selected.source?.name} | {selected.marketplace}</div>
               </div>
 
@@ -617,7 +818,18 @@ export default function CategoryPage() {
                           {selectedCategoryAttributesData?.productCount !== undefined && ` ${selectedCategoryAttributesData.productCount} urun etkilenecek.`}
                         </div>
                       </div>
-                      {isFetchingSelectedAttributes && <span className="text-xs text-gray-500">Aliniyor...</span>}
+                      <div className="flex flex-col items-end gap-2">
+                        {isFetchingSelectedAttributes && <span className="text-xs text-gray-500">Aliniyor...</span>}
+                        <label className="flex items-center gap-2 text-xs text-gray-400">
+                          <input
+                            type="checkbox"
+                            checked={showMandatoryOnly}
+                            onChange={e => setShowMandatoryOnly(e.target.checked)}
+                            className="h-4 w-4"
+                          />
+                          Sadece zorunlu
+                        </label>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-3 gap-3 mb-4">
@@ -640,16 +852,137 @@ export default function CategoryPage() {
                       onChange={(attributeId, value) =>
                         setMappingAttributeValues(values => ({ ...values, [attributeId]: value }))
                       }
+                      mandatoryOnly={showMandatoryOnly}
                       emptyMessage={`Bu kategori icin alinmis ${selected.marketplace} alan bilgisi bulunamadi.`}
                     />
 
-                    <button
-                      onClick={() => saveMappingAttributesMutation.mutate()}
-                      disabled={saveMappingAttributesMutation.isPending || isFetchingSelectedAttributes || selectedCategoryAttributeFields.length === 0}
-                      className="mt-4 w-full bg-blue-700 hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm py-2.5 rounded-xl transition-colors font-medium"
-                    >
-                      {saveMappingAttributesMutation.isPending ? 'Kaydediliyor...' : 'Alanlari Kaydet'}
-                    </button>
+                    <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        onClick={() => saveMappingAttributesMutation.mutate()}
+                        disabled={saveMappingAttributesMutation.isPending || isFetchingSelectedAttributes || selectedCategoryAttributeFields.length === 0}
+                        className="bg-blue-700 hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm py-2.5 rounded-xl transition-colors font-medium"
+                      >
+                        {saveMappingAttributesMutation.isPending ? 'Kaydediliyor...' : 'Degerleri Kural Olarak Kaydet'}
+                      </button>
+                      <button
+                        onClick={() => previewAttributeRulesMutation.mutate()}
+                        disabled={previewAttributeRulesMutation.isPending || !selected?.id}
+                        className="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-gray-100 text-sm py-2.5 rounded-xl border border-gray-700 transition-colors font-medium"
+                      >
+                        {previewAttributeRulesMutation.isPending ? 'Hesaplaniyor...' : 'Kurallari Onizle'}
+                      </button>
+                    </div>
+
+                    {attributeRulePreview && (
+                      <div className="mt-3 rounded-xl border border-blue-900/60 bg-blue-950/20 p-3">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                          {[
+                            ['Urun', attributeRulePreview.productCount],
+                            ['Uygulanabilir', attributeRulePreview.applicable],
+                            ['Mevcut korundu', attributeRulePreview.skippedExisting],
+                            ['Manuel korundu', attributeRulePreview.skippedManual],
+                          ].map(([label, value]) => (
+                            <div key={String(label)} className="rounded-lg bg-gray-950/70 px-2 py-2">
+                              <div className="text-lg font-bold text-gray-100">{value}</div>
+                              <div className="text-[11px] text-gray-500">{label}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <button
+                          onClick={() => applyAttributeRulesMutation.mutate()}
+                          disabled={applyAttributeRulesMutation.isPending || attributeRulePreview.applicable === 0}
+                          className="mt-3 w-full bg-green-700 hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm py-2.5 rounded-xl transition-colors font-medium"
+                        >
+                          {applyAttributeRulesMutation.isPending
+                            ? 'Uygulaniyor...'
+                            : `Onayla ve ${attributeRulePreview.applicable} Alani Uygula`}
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="mt-5 border-t border-gray-800 pt-4">
+                      <div className="text-sm font-semibold text-gray-100">Kosullu Ozellik Kurali</div>
+                      <div className="mt-1 text-xs text-gray-500">
+                        Urun adi, marka veya XML alani eslestiginde secilen deger otomatik uygulanir.
+                      </div>
+                      <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <select
+                          value={conditionalAttributeId}
+                          onChange={event => setConditionalAttributeId(event.target.value)}
+                          className="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100"
+                        >
+                          <option value="">Ozellik secin</option>
+                          {selectedCategoryAttributeFields.map(attr => (
+                            <option key={attr.attributeId} value={attr.attributeId}>{attr.attributeName}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={conditionalMatchType}
+                          onChange={event => setConditionalMatchType(event.target.value as Exclude<AttributeRuleMatchType, 'ALWAYS'>)}
+                          className="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100"
+                        >
+                          <option value="TITLE_CONTAINS">Urun adi sunu icerir</option>
+                          <option value="BRAND_EQUALS">Marka sununla esittir</option>
+                          <option value="XML_ATTRIBUTE_EQUALS">XML alani sununla esittir</option>
+                        </select>
+                        {conditionalMatchType === 'XML_ATTRIBUTE_EQUALS' && (
+                          <input
+                            value={conditionalMatchField}
+                            onChange={event => setConditionalMatchField(event.target.value)}
+                            placeholder="XML alan adi, orn. Materyal"
+                            className="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500"
+                          />
+                        )}
+                        <input
+                          value={conditionalMatchValue}
+                          onChange={event => setConditionalMatchValue(event.target.value)}
+                          placeholder="Eslesecek ifade"
+                          className="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500"
+                        />
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500">
+                        Uygulanacak deger, yukaridaki ozellik alaninda secili olan degerdir.
+                      </div>
+                      <button
+                        onClick={() => createConditionalRuleMutation.mutate()}
+                        disabled={
+                          createConditionalRuleMutation.isPending
+                          || !conditionalAttributeId
+                          || !conditionalMatchValue.trim()
+                          || !(mappingAttributeValues[conditionalAttributeId] ?? '').trim()
+                          || (conditionalMatchType === 'XML_ATTRIBUTE_EQUALS' && !conditionalMatchField.trim())
+                        }
+                        className="mt-3 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
+                      >
+                        {createConditionalRuleMutation.isPending ? 'Kaydediliyor...' : 'Kosullu Kurali Kaydet'}
+                      </button>
+
+                      {(attributeRulesData?.data?.length ?? 0) > 0 && (
+                        <div className="mt-4 border-t border-gray-800 divide-y divide-gray-800">
+                          {attributeRulesData?.data.map(rule => (
+                            <div key={rule.id} className="flex items-start justify-between gap-3 py-3">
+                              <div className="min-w-0">
+                                <div className="text-sm text-gray-200 truncate">{rule.attributeName || rule.attributeId}</div>
+                                <div className="text-xs text-gray-500 mt-1">
+                                  {rule.matchType === 'ALWAYS'
+                                    ? 'Her urune'
+                                    : `${rule.matchType}${rule.matchField ? ` (${rule.matchField})` : ''}: ${rule.matchValue}`}
+                                  {' -> '}
+                                  {rule.valueText || rule.valueId}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => deleteAttributeRuleMutation.mutate(rule.id)}
+                                disabled={deleteAttributeRuleMutation.isPending}
+                                className="shrink-0 text-xs text-red-300 hover:text-red-200 px-2 py-1"
+                              >
+                                Sil
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
 

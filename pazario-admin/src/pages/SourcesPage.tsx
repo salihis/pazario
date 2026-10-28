@@ -9,6 +9,9 @@ interface XmlSource {
   fallbackUrl: string | null
   fetchTimeoutSec: number
   categoryIncludeKeywords: string | null
+  priceIncludesVat: boolean
+  purchaseVatRate: string | number
+  purchaseExtraFee: string | number
   autoSyncEnabled: boolean
   autoSyncTime: string
   lastAutoSyncAt: string | null
@@ -27,6 +30,21 @@ interface SyncJob {
   startedAt: string | null
   finishedAt: string | null
   createdAt: string
+}
+
+type EditSourceForm = {
+  id: string
+  name: string
+  url: string
+  fallbackUrl: string
+  fetchTimeoutSec: number
+  categoryIncludeKeywords: string
+  priceIncludesVat: boolean
+  purchaseVatRate: string | number
+  purchaseExtraFee: string | number
+  autoSyncEnabled: boolean
+  autoSyncTime: string
+  active: boolean
 }
 
 interface TestResult {
@@ -88,6 +106,14 @@ const fieldLabels: Record<string, string> = {
 
 const steps = ['XML linki', 'Test ve onizleme', 'Kurallar', 'Kaydet']
 
+function getApiErrorMessage(error: unknown, fallback: string): string {
+  const err = error as { response?: { data?: { error?: string } | string }; message?: string }
+  const responseData = err.response?.data
+  if (typeof responseData === 'string' && responseData.trim()) return responseData
+  if (typeof responseData === 'object' && responseData?.error) return responseData.error
+  return err.message || fallback
+}
+
 function resetWizardState() {
   return {
     name: '',
@@ -97,7 +123,9 @@ function resetWizardState() {
     categoryIncludeKeywords: '',
     minStock: 6,
     priceField: 'Otomatik',
-    vatIncluded: true,
+    priceIncludesVat: true,
+    purchaseVatRate: 20,
+    purchaseExtraFee: 0,
     hideLowStock: true,
     syncAfterCreate: true,
     autoSyncEnabled: true,
@@ -112,9 +140,13 @@ export default function SourcesPage() {
   const [wizard, setWizard] = useState(resetWizardState)
   const [testResult, setTestResult] = useState<TestResult | null>(null)
   const [testError, setTestError] = useState('')
+  const [wizardSaveError, setWizardSaveError] = useState('')
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null)
   const [selectedSyncIds, setSelectedSyncIds] = useState<string[]>([])
   const [bulkSyncMessage, setBulkSyncMessage] = useState('')
+  const [editingSource, setEditingSource] = useState<EditSourceForm | null>(null)
+  const [editError, setEditError] = useState('')
+  const [deleteError, setDeleteError] = useState('')
 
   const { data: sources, isLoading } = useQuery<{ data: XmlSource[] }>({
     queryKey: ['sources'],
@@ -134,6 +166,7 @@ export default function SourcesPage() {
     setWizard(resetWizardState())
     setTestResult(null)
     setTestError('')
+    setWizardSaveError('')
   }
 
   const testMutation = useMutation({
@@ -198,18 +231,28 @@ export default function SourcesPage() {
 
   const createWizardMutation = useMutation({
     mutationFn: async () => {
+      setWizardSaveError('')
       const created = await api.post('/sources', {
         name: wizard.name,
         url: wizard.url,
         fallbackUrl: wizard.fallbackUrl,
         fetchTimeoutSec: wizard.fetchTimeoutSec,
         categoryIncludeKeywords: wizard.categoryIncludeKeywords,
+        priceIncludesVat: wizard.priceIncludesVat,
+        purchaseVatRate: wizard.purchaseVatRate,
+        purchaseExtraFee: wizard.purchaseExtraFee,
         autoSyncEnabled: wizard.autoSyncEnabled,
         autoSyncTime: wizard.autoSyncTime,
       })
       const sourceId = created.data.data.id as string
       if (wizard.syncAfterCreate) {
-        await api.post(`/sources/${sourceId}/sync`)
+        try {
+          await api.post(`/sources/${sourceId}/sync`)
+        } catch (error) {
+          queryClient.invalidateQueries({ queryKey: ['sources'] })
+          setSelectedSourceId(sourceId)
+          throw new Error(`Kaynak kaydedildi ancak senkronizasyon baslatilamadi: ${getApiErrorMessage(error, 'Sunucu hatasi')}`)
+        }
       }
       return sourceId
     },
@@ -217,6 +260,9 @@ export default function SourcesPage() {
       queryClient.invalidateQueries({ queryKey: ['sources'] })
       setSelectedSourceId(sourceId)
       closeWizard()
+    },
+    onError: error => {
+      setWizardSaveError(getApiErrorMessage(error, 'Kaynak kaydedilemedi.'))
     },
   })
 
@@ -227,9 +273,43 @@ export default function SourcesPage() {
   })
 
   const updateSourceMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Partial<Pick<XmlSource, 'autoSyncEnabled' | 'autoSyncTime' | 'fetchTimeoutSec' | 'categoryIncludeKeywords' | 'fallbackUrl'>> }) =>
+    mutationFn: ({ id, data }: { id: string; data: Partial<Pick<XmlSource, 'name' | 'url' | 'active' | 'autoSyncEnabled' | 'autoSyncTime' | 'fetchTimeoutSec' | 'categoryIncludeKeywords' | 'fallbackUrl' | 'priceIncludesVat' | 'purchaseVatRate' | 'purchaseExtraFee'>> }) =>
       api.put(`/sources/${id}`, data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sources'] }),
+  })
+
+  const editSourceMutation = useMutation({
+    mutationFn: (form: EditSourceForm) => api.put(`/sources/${form.id}`, {
+      name: form.name.trim(),
+      url: form.url.trim(),
+      fallbackUrl: form.fallbackUrl.trim(),
+      fetchTimeoutSec: form.fetchTimeoutSec,
+      categoryIncludeKeywords: form.categoryIncludeKeywords.trim(),
+      priceIncludesVat: form.priceIncludesVat,
+      purchaseVatRate: form.purchaseVatRate,
+      purchaseExtraFee: form.purchaseExtraFee,
+      autoSyncEnabled: form.autoSyncEnabled,
+      autoSyncTime: form.autoSyncTime,
+      active: form.active,
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['sources'] })
+      setEditingSource(null)
+      setEditError('')
+    },
+    onError: error => setEditError(getApiErrorMessage(error, 'Kaynak guncellenemedi.')),
+  })
+
+  const deleteSourceMutation = useMutation({
+    mutationFn: (id: string) => api.delete(`/sources/${id}`),
+    onSuccess: (_, id) => {
+      setDeleteError('')
+      queryClient.invalidateQueries({ queryKey: ['sources'] })
+      queryClient.invalidateQueries({ queryKey: ['sync-jobs'] })
+      setSelectedSyncIds(current => current.filter(item => item !== id))
+      if (selectedSourceId === id) setSelectedSourceId(null)
+    },
+    onError: error => setDeleteError(getApiErrorMessage(error, 'Kaynak silinemedi.')),
   })
 
   const readyForSave = Boolean(wizard.name && wizard.url && (!testResult || testResult.turkishStatus === 'OK'))
@@ -248,6 +328,28 @@ export default function SourcesPage() {
     setSelectedSyncIds(allActiveSelected ? [] : activeSourceIds)
   }
   const clearSelection = () => setSelectedSyncIds([])
+  const openEditSource = (source: XmlSource) => {
+    setEditingSource({
+      id: source.id,
+      name: source.name,
+      url: source.url,
+      fallbackUrl: source.fallbackUrl ?? '',
+      fetchTimeoutSec: source.fetchTimeoutSec,
+      categoryIncludeKeywords: source.categoryIncludeKeywords ?? '',
+      priceIncludesVat: source.priceIncludesVat !== false,
+      purchaseVatRate: source.purchaseVatRate ?? 0,
+      purchaseExtraFee: source.purchaseExtraFee ?? 0,
+      autoSyncEnabled: source.autoSyncEnabled,
+      autoSyncTime: source.autoSyncTime || '03:00',
+      active: source.active,
+    })
+    setEditError('')
+  }
+  const deleteSource = (source: XmlSource) => {
+    if (!window.confirm(`${source.name} kaynagini silmek istiyor musunuz? Bu islem geri alinamaz.`)) return
+    setDeleteError('')
+    deleteSourceMutation.mutate(source.id)
+  }
 
   return (
     <div className="p-6">
@@ -327,6 +429,11 @@ export default function SourcesPage() {
             {bulkSyncMessage}
           </div>
         )}
+        {deleteError && (
+          <div className="mt-3 rounded-lg border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+            {deleteError}
+          </div>
+        )}
       </div>
 
       <div className="flex gap-4">
@@ -380,6 +487,11 @@ export default function SourcesPage() {
                           Kategori filtresi: {source.categoryIncludeKeywords}
                         </div>
                       )}
+                      <div className="text-xs text-emerald-300 mt-1">
+                        Alis maliyeti: XML fiyat {source.priceIncludesVat === false ? 'KDV haric' : 'KDV dahil'}
+                        {source.priceIncludesVat === false ? ` + %${Number(source.purchaseVatRate ?? 0).toLocaleString('tr-TR')} KDV` : ''}
+                        {Number(source.purchaseExtraFee ?? 0) > 0 ? ` + ${Number(source.purchaseExtraFee).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} TL ek ucret` : ''}
+                      </div>
                       <div className="text-xs text-gray-600 mt-1">{source._count.products.toLocaleString('tr-TR')} urun</div>
                       <div className="mt-3 flex flex-wrap items-center gap-2" onClick={e => e.stopPropagation()}>
                         <label className="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-950 px-2 py-1 text-xs text-gray-300">
@@ -457,6 +569,12 @@ export default function SourcesPage() {
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
                       <button
+                        onClick={e => { e.stopPropagation(); openEditSource(source) }}
+                        className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 px-2 py-1 rounded transition-colors"
+                      >
+                        Duzenle
+                      </button>
+                      <button
                         onClick={e => { e.stopPropagation(); toggleMutation.mutate({ id: source.id, active: !source.active }) }}
                         className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-400 px-2 py-1 rounded transition-colors"
                       >
@@ -468,6 +586,13 @@ export default function SourcesPage() {
                         className="text-xs bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded transition-colors disabled:opacity-50"
                       >
                         Sync
+                      </button>
+                      <button
+                        onClick={e => { e.stopPropagation(); deleteSource(source) }}
+                        disabled={deleteSourceMutation.isPending}
+                        className="text-xs bg-red-950 hover:bg-red-900 text-red-200 px-2 py-1 rounded transition-colors disabled:opacity-50"
+                      >
+                        Sil
                       </button>
                     </div>
                   </div>
@@ -524,6 +649,177 @@ export default function SourcesPage() {
           </div>
         )}
       </div>
+
+      {editingSource && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 rounded-xl border border-gray-700 w-full max-w-2xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-gray-100">XML Kaynagini Duzenle</h2>
+                <p className="text-xs text-gray-500 mt-1">Kaynak adi, link ve otomatik guncelleme ayarlari</p>
+              </div>
+              <button
+                onClick={() => setEditingSource(null)}
+                disabled={editSourceMutation.isPending}
+                className="text-gray-500 hover:text-gray-300 disabled:opacity-50"
+              >
+                X
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Kaynak adi</label>
+                  <input
+                    type="text"
+                    value={editingSource.name}
+                    onChange={e => setEditingSource(source => source ? { ...source, name: e.target.value } : source)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Timeout (saniye)</label>
+                  <input
+                    type="number"
+                    min={10}
+                    max={600}
+                    value={editingSource.fetchTimeoutSec}
+                    onChange={e => setEditingSource(source => source ? { ...source, fetchTimeoutSec: parseInt(e.target.value || '60') } : source)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">XML linki</label>
+                <input
+                  type="text"
+                  value={editingSource.url}
+                  onChange={e => setEditingSource(source => source ? { ...source, url: e.target.value } : source)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Yedek XML dosyasi / URL</label>
+                <input
+                  type="text"
+                  value={editingSource.fallbackUrl}
+                  onChange={e => setEditingSource(source => source ? { ...source, fallbackUrl: e.target.value } : source)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Kategori filtresi</label>
+                <input
+                  type="text"
+                  value={editingSource.categoryIncludeKeywords}
+                  onChange={e => setEditingSource(source => source ? { ...source, categoryIncludeKeywords: e.target.value } : source)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div className="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                <div className="text-sm font-bold text-gray-200 mb-3">Alis maliyeti ayari</div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <label className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-900 p-3">
+                    <input
+                      type="checkbox"
+                      checked={editingSource.priceIncludesVat}
+                      onChange={e => setEditingSource(source => source ? { ...source, priceIncludesVat: e.target.checked } : source)}
+                      className="h-4 w-4 accent-blue-600"
+                    />
+                    <span className="text-sm text-gray-200">XML fiyati KDV dahil</span>
+                  </label>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">KDV orani (%)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step="0.01"
+                      value={editingSource.purchaseVatRate}
+                      disabled={editingSource.priceIncludesVat}
+                      onChange={e => setEditingSource(source => source ? { ...source, purchaseVatRate: e.target.value } : source)}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-500 block mb-1">Ek ucret (TL)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={editingSource.purchaseExtraFee}
+                      onChange={e => setEditingSource(source => source ? { ...source, purchaseExtraFee: e.target.value } : source)}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500 mt-2">
+                  KDV dahil degilse alis maliyeti = XML fiyati + KDV + ek ucret olarak hesaplanir.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <label className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-950 p-3">
+                  <input
+                    type="checkbox"
+                    checked={editingSource.active}
+                    onChange={e => setEditingSource(source => source ? { ...source, active: e.target.checked } : source)}
+                    className="h-4 w-4 accent-blue-600"
+                  />
+                  <span className="text-sm text-gray-200">Aktif</span>
+                </label>
+                <label className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-950 p-3">
+                  <input
+                    type="checkbox"
+                    checked={editingSource.autoSyncEnabled}
+                    onChange={e => setEditingSource(source => source ? { ...source, autoSyncEnabled: e.target.checked } : source)}
+                    className="h-4 w-4 accent-blue-600"
+                  />
+                  <span className="text-sm text-gray-200">Otomatik</span>
+                </label>
+                <div>
+                  <label className="text-xs text-gray-500 block mb-1">Guncelleme saati</label>
+                  <input
+                    type="time"
+                    value={editingSource.autoSyncTime}
+                    disabled={!editingSource.autoSyncEnabled}
+                    onChange={e => setEditingSource(source => source ? { ...source, autoSyncTime: e.target.value } : source)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                  />
+                </div>
+              </div>
+
+              {editError && (
+                <div className="rounded-lg border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+                  {editError}
+                </div>
+              )}
+            </div>
+
+            <div className="px-6 py-4 border-t border-gray-800 flex items-center justify-end gap-3">
+              <button
+                onClick={() => setEditingSource(null)}
+                disabled={editSourceMutation.isPending}
+                className="bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 px-4 py-2 rounded-lg text-sm"
+              >
+                Vazgec
+              </button>
+              <button
+                onClick={() => editSourceMutation.mutate(editingSource)}
+                disabled={!editingSource.name.trim() || !editingSource.url.trim() || editSourceMutation.isPending}
+                className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium"
+              >
+                {editSourceMutation.isPending ? 'Kaydediliyor...' : 'Kaydet'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showWizard && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -722,10 +1018,42 @@ export default function SourcesPage() {
                         className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
                       />
                     </div>
-                    <label className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-950 p-3">
-                      <input type="checkbox" checked={wizard.vatIncluded} onChange={e => setWizard(p => ({ ...p, vatIncluded: e.target.checked }))} />
-                      <span className="text-sm text-gray-200">XML fiyatlarina KDV dahil</span>
-                    </label>
+                    <div className="rounded-lg border border-gray-800 bg-gray-950 p-3">
+                      <label className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          checked={wizard.priceIncludesVat}
+                          onChange={e => setWizard(p => ({ ...p, priceIncludesVat: e.target.checked }))}
+                        />
+                        <span className="text-sm text-gray-200">XML fiyatlarina KDV dahil</span>
+                      </label>
+                      <div className="grid grid-cols-2 gap-3 mt-3">
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">KDV orani (%)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={100}
+                            step="0.01"
+                            value={wizard.purchaseVatRate}
+                            disabled={wizard.priceIncludesVat}
+                            onChange={e => setWizard(p => ({ ...p, purchaseVatRate: e.target.value }))}
+                            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500 block mb-1">Ek ucret (TL)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            value={wizard.purchaseExtraFee}
+                            onChange={e => setWizard(p => ({ ...p, purchaseExtraFee: e.target.value }))}
+                            className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                          />
+                        </div>
+                      </div>
+                    </div>
                     <label className="flex items-center gap-3 rounded-lg border border-gray-800 bg-gray-950 p-3">
                       <input type="checkbox" checked={wizard.hideLowStock} onChange={e => setWizard(p => ({ ...p, hideLowStock: e.target.checked }))} />
                       <span className="text-sm text-gray-200">Stok kosulunu saglamayanlari pazaryerine gonderme</span>
@@ -775,13 +1103,18 @@ export default function SourcesPage() {
                       <div className="text-gray-500">Filtre sonrasi</div><div className="text-gray-100">{testResult?.filteredProducts !== undefined ? testResult.filteredProducts.toLocaleString('tr-TR') : 'Senkron sirasinda hesaplanacak'}</div>
                       <div className="text-gray-500">Stok uygun</div><div className="text-green-300">{testResult ? testResult.stockOk.toLocaleString('tr-TR') : 'Senkron sirasinda hesaplanacak'}</div>
                       <div className="text-gray-500">Fiyat alani</div><div className="text-gray-100">{wizard.priceField}</div>
+                      <div className="text-gray-500">Alis maliyeti</div>
+                      <div className="text-gray-100">
+                        XML fiyat {wizard.priceIncludesVat ? 'KDV dahil' : `KDV haric + %${wizard.purchaseVatRate} KDV`}
+                        {Number(wizard.purchaseExtraFee || 0) > 0 ? ` + ${Number(wizard.purchaseExtraFee).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} TL` : ''}
+                      </div>
                       <div className="text-gray-500">Otomatik guncelleme</div><div className="text-gray-100">{wizard.autoSyncEnabled ? wizard.autoSyncTime : 'Kapali'}</div>
                       <div className="text-gray-500">Turkce karakter</div><div className={testResult?.turkishStatus === 'OK' || !testResult ? 'text-green-300' : 'text-red-300'}>{testResult ? (testResult.turkishStatus === 'OK' ? 'Sorun yok' : 'Sorun var') : 'Test atlandi'}</div>
                     </div>
                   </div>
-                  {createWizardMutation.isError && (
+                  {(createWizardMutation.isError || wizardSaveError) && (
                     <div className="rounded-lg border border-red-900 bg-red-950/30 px-3 py-2 text-sm text-red-200">
-                      Kaynak kaydedilemedi.
+                      {wizardSaveError || 'Kaynak kaydedilemedi.'}
                     </div>
                   )}
                 </div>

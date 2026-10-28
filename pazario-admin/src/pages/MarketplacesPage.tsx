@@ -91,6 +91,7 @@ const STATUS_TABS = [
   { value: 'FAILED', label: 'Hatali' },
   { value: 'DELISTED', label: 'Pasif' },
 ]
+const PAGE_SIZE_OPTIONS = [25, 50, 100]
 
 const statusColor: Record<string, string> = {
   PUBLISHED: 'text-green-400 bg-green-900/30',
@@ -109,7 +110,7 @@ const statusLabel: Record<string, string> = {
 export default function MarketplacesPage() {
   const queryClient = useQueryClient()
   const [marketplace, setMarketplace] = useState('TRENDYOL')
-  const [status, setStatus] = useState('')
+  const [status, setStatus] = useState('PUBLISHED')
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(1)
@@ -120,7 +121,7 @@ export default function MarketplacesPage() {
   const [autoMode, setAutoMode] = useState<'stock' | 'price' | 'stock-price'>('stock-price')
   const [autoTime, setAutoTime] = useState('03:00')
   const [autoLimit, setAutoLimit] = useState(1000)
-  const limit = 25
+  const [pageSize, setPageSize] = useState(25)
 
   const resetPage = () => setPage(1)
 
@@ -133,7 +134,7 @@ export default function MarketplacesPage() {
   })
 
   const { data, isLoading } = useQuery<ListingsResponse>({
-    queryKey: ['marketplace-listings', marketplace, status, search, page],
+    queryKey: ['marketplace-listings', marketplace, status, search, page, pageSize],
     queryFn: () =>
       api.get('/marketplace-listings', {
         params: {
@@ -141,7 +142,7 @@ export default function MarketplacesPage() {
           status: status || undefined,
           search: search || undefined,
           page,
-          limit,
+          limit: pageSize,
         },
       }).then(r => r.data),
   })
@@ -160,6 +161,11 @@ export default function MarketplacesPage() {
     setAutoLimit(currentSyncSetting?.limit ?? 1000)
   }, [currentSyncSetting?.enabled, currentSyncSetting?.limit, currentSyncSetting?.mode, currentSyncSetting?.scheduleTime])
 
+  useEffect(() => {
+    setUnmatched(null)
+    setSelectedBarcodes([])
+  }, [marketplace])
+
   const importMarketplace = useMutation({
     mutationFn: (targetMarketplace: string) =>
       api.post<{ success: boolean; data: MarketplaceImportResult }>(`/marketplace-listings/import/${targetMarketplace.toLowerCase()}`, {
@@ -174,9 +180,9 @@ export default function MarketplacesPage() {
         ? ' Liste sonuna kadar okunamadigi icin pasife alma yapilmadi.'
         : ''
       setImportMessage(
-        `${result.marketplace} icin ${result.fetched} urun okundu, ${result.matched} urun eslesti, ${result.imported} kayit guncellendi, ${result.delisted} kayit pazaryerinde bulunamadigi icin pasife alindi.${emptyMatchNote}${partialScanNote}`
+        `${result.marketplace} icin ${result.fetched} satistaki urun okundu, ${result.matched} urun eslesti, ${result.imported} kayit guncellendi, ${result.delisted} kayit artik satista olmadigi icin pasife alindi.${emptyMatchNote}${partialScanNote}`
       )
-      setStatus('')
+      setStatus('PUBLISHED')
       setPage(1)
       queryClient.invalidateQueries({ queryKey: ['marketplace-listing-stats'] })
       queryClient.invalidateQueries({ queryKey: ['marketplace-listings'] })
@@ -201,7 +207,7 @@ export default function MarketplacesPage() {
         marketplace,
         dryRun: false,
         limit: autoLimit,
-      }).then(r => r.data.data)
+      }, { timeout: 120000 }).then(r => r.data.data)
     },
     onSuccess: result => {
       const labels: Record<string, string> = {
@@ -216,7 +222,9 @@ export default function MarketplacesPage() {
       queryClient.invalidateQueries({ queryKey: ['marketplace-listings'] })
     },
     onError: (error: any) => {
-      const detail = error?.response?.data?.detail || error?.response?.data?.error || 'Guncelleme basarisiz'
+      const detail = error?.code === 'ECONNABORTED'
+        ? 'Guncelleme zaman asimina ugradi. Pazaryeri API yaniti gecikti; paket limitini dusurup tekrar deneyin.'
+        : error?.response?.data?.detail || error?.response?.data?.error || error?.message || 'Guncelleme basarisiz'
       setImportMessage(String(detail))
     },
   })
@@ -244,13 +252,14 @@ export default function MarketplacesPage() {
   const findUnmatched = useMutation({
     mutationFn: () =>
       api.get<{ success: boolean; data: UnmatchedMarketplaceResult }>('/marketplace-listings/unmatched', {
-        params: { marketplace, size: 100, maxPages: 20 },
+        params: { marketplace, size: 100, maxPages: 300 },
+        timeout: 300000,
       }).then(r => r.data.data),
     onSuccess: result => {
       setUnmatched(result)
       setSelectedBarcodes([])
       setImportMessage(
-        `${result.marketplace} icin ${result.fetched} urun okundu, ${result.matched} urun DB ile eslesti, ${result.unmatchedCount} urun eslesmedi.`
+        `${result.marketplace} icin ${result.fetched} satistaki urun okundu, ${result.matched} urun DB ile eslesti, ${result.unmatchedCount} urun eslesmedi.`
       )
     },
     onError: (error: any) => {
@@ -278,7 +287,7 @@ export default function MarketplacesPage() {
     },
   })
 
-  const totalPages = data ? Math.max(1, Math.ceil(data.meta.total / limit)) : 1
+  const totalPages = data ? Math.max(1, Math.ceil(data.meta.total / pageSize)) : 1
 
   const handleSearch = () => {
     setSearch(searchInput)
@@ -313,15 +322,13 @@ export default function MarketplacesPage() {
             Sadece pazaryeri API'lerinden okunan urunler burada gorunur
           </p>
         </div>
-        {marketplace !== 'HEPSIBURADA' && (
-          <button
-            onClick={() => importMarketplace.mutate(marketplace)}
-            disabled={importMarketplace.isPending}
-            className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
-          >
-            {importMarketplace.isPending ? `${marketplace} okunuyor...` : `${marketplace} durumlarini kontrol et`}
-          </button>
-        )}
+        <button
+          onClick={() => importMarketplace.mutate(marketplace)}
+          disabled={importMarketplace.isPending}
+          className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
+        >
+          {importMarketplace.isPending ? `${marketplace} okunuyor...` : `${marketplace} satistaki urunleri kontrol et`}
+        </button>
       </div>
 
       {importMessage && (
@@ -334,31 +341,29 @@ export default function MarketplacesPage() {
         <div className="flex flex-wrap items-center gap-3">
           <button
             onClick={() => syncMarketplace.mutate('stock')}
-            disabled={syncMarketplace.isPending || marketplace === 'HEPSIBURADA'}
+            disabled={syncMarketplace.isPending}
             className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
           >
             Stok Guncelle
           </button>
           <button
             onClick={() => syncMarketplace.mutate('price')}
-            disabled={syncMarketplace.isPending || marketplace === 'HEPSIBURADA'}
+            disabled={syncMarketplace.isPending}
             className="bg-amber-700 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
           >
             Fiyat Guncelle
           </button>
           <button
             onClick={() => syncMarketplace.mutate('stock-price')}
-            disabled={syncMarketplace.isPending || marketplace === 'HEPSIBURADA'}
+            disabled={syncMarketplace.isPending}
             className="bg-purple-700 hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
           >
             Stok ve Fiyat Guncelle
           </button>
           <span className="text-xs text-gray-500">
-            {marketplace === 'HEPSIBURADA'
-              ? 'Bu pazaryeri icin stok/fiyat endpointi henuz dogrulanmadi.'
-              : syncMarketplace.isPending
-                ? 'Guncelleme gonderiliyor...'
-                : 'Yayindaki urunler icin calisir.'}
+            {syncMarketplace.isPending
+              ? 'Guncelleme gonderiliyor...'
+              : 'Yayindaki urunler icin calisir.'}
           </span>
         </div>
         <div className="mt-4 grid grid-cols-1 lg:grid-cols-[auto_180px_160px_120px_auto_1fr] gap-3 items-end border-t border-gray-800 pt-4">
@@ -393,7 +398,7 @@ export default function MarketplacesPage() {
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Limit</label>
+            <label className="block text-xs text-gray-500 mb-1">Paket limiti</label>
             <input
               type="number"
               min={1}
@@ -411,22 +416,19 @@ export default function MarketplacesPage() {
             {saveSyncSetting.isPending ? 'Kaydediliyor...' : 'Ayar Kaydet'}
           </button>
           <div className="text-xs text-gray-500">
-            {marketplace === 'HEPSIBURADA'
-              ? 'Saat ayari kaydedilir; stok/fiyat endpointi dogrulandiginda otomatik calisma aktif kullanilir.'
-              : currentSyncSetting?.lastRunAt
-              ? `Son otomatik calisma: ${new Date(currentSyncSetting.lastRunAt).toLocaleString('tr-TR')}`
-              : 'Otomatik ayar kaydedildiginde belirtilen saatte gunde bir kez calisir.'}
+            {currentSyncSetting?.lastRunAt
+              ? `Son otomatik calisma: ${new Date(currentSyncSetting.lastRunAt).toLocaleString('tr-TR')}. Paket dolarsa 5 dakika sonra devam eder.`
+              : 'Belirtilen saatte baslar; paket dolarsa 5 dakika arayla tum uygun urunler bitene kadar devam eder.'}
           </div>
         </div>
       </div>
 
-      {marketplace === 'TRENDYOL' && (
-        <div className="mb-5 rounded-lg border border-gray-800 bg-gray-900 p-4">
+      <div className="mb-5 rounded-lg border border-gray-800 bg-gray-900 p-4">
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div>
-              <div className="text-sm font-semibold text-gray-100">DB ile eslesmeyen Trendyol urunleri</div>
+              <div className="text-sm font-semibold text-gray-100">DB ile eslesmeyen {marketplace} urunleri</div>
               <div className="text-xs text-gray-500 mt-1">
-                Once listeyi kontrol edin, sonra sadece sectiginiz barkodlar arsivlenir.
+                Yalnizca pazaryerinde satis durumunda olan urunler kontrol edilir.
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -437,13 +439,15 @@ export default function MarketplacesPage() {
               >
                 {findUnmatched.isPending ? 'Kontrol ediliyor...' : 'Eslesmeyenleri Bul'}
               </button>
-              <button
-                onClick={() => archiveUnmatched.mutate()}
-                disabled={archiveUnmatched.isPending || selectedBarcodes.length === 0}
-                className="bg-red-700 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
-              >
-                {archiveUnmatched.isPending ? 'Arsivleniyor...' : `Secilenleri Arsive Al (${selectedBarcodes.length})`}
-              </button>
+              {marketplace === 'TRENDYOL' && (
+                <button
+                  onClick={() => archiveUnmatched.mutate()}
+                  disabled={archiveUnmatched.isPending || selectedBarcodes.length === 0}
+                  className="bg-red-700 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors"
+                >
+                  {archiveUnmatched.isPending ? 'Arsivleniyor...' : `Secilenleri Arsive Al (${selectedBarcodes.length})`}
+                </button>
+              )}
             </div>
           </div>
 
@@ -451,21 +455,23 @@ export default function MarketplacesPage() {
             <div className="border border-gray-800 rounded-lg overflow-hidden">
               <div className="flex items-center justify-between gap-3 px-3 py-2 border-b border-gray-800 bg-gray-950/40">
                 <span className="text-xs text-gray-400">
-                  {unmatched.fetched} okundu, {unmatched.matched} eslesti, {unmatched.unmatchedCount} eslesmedi
+                  {unmatched.fetched} satistaki urun okundu, {unmatched.matched} eslesti, {unmatched.unmatchedCount} eslesmedi
                 </span>
-                <button
-                  onClick={toggleAllVisible}
-                  disabled={selectableBarcodes.length === 0}
-                  className="text-xs text-blue-300 disabled:text-gray-600"
-                >
-                  {allVisibleSelected ? 'Tum secimi kaldir' : 'Gorunen barkodlari sec'}
-                </button>
+                {marketplace === 'TRENDYOL' && (
+                  <button
+                    onClick={toggleAllVisible}
+                    disabled={selectableBarcodes.length === 0}
+                    className="text-xs text-blue-300 disabled:text-gray-600"
+                  >
+                    {allVisibleSelected ? 'Tum secimi kaldir' : 'Gorunen barkodlari sec'}
+                  </button>
+                )}
               </div>
               <div className="max-h-80 overflow-auto">
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-gray-900">
                     <tr className="border-b border-gray-800 text-gray-400 text-xs uppercase">
-                      <th className="text-left px-3 py-2 w-10">Sec</th>
+                      {marketplace === 'TRENDYOL' && <th className="text-left px-3 py-2 w-10">Sec</th>}
                       <th className="text-left px-3 py-2">Urun</th>
                       <th className="text-left px-3 py-2">Barkod</th>
                       <th className="text-left px-3 py-2">Stok Kodu</th>
@@ -474,22 +480,24 @@ export default function MarketplacesPage() {
                   <tbody>
                     {visibleUnmatched.length === 0 ? (
                       <tr>
-                        <td colSpan={4} className="text-center py-8 text-gray-500">
+                        <td colSpan={marketplace === 'TRENDYOL' ? 4 : 3} className="text-center py-8 text-gray-500">
                           Eslesmeyen urun bulunmadi
                         </td>
                       </tr>
                     ) : (
                       visibleUnmatched.map((item, index) => (
                         <tr key={`${item.barcode}-${item.stockCode}-${index}`} className="border-b border-gray-800/50">
-                          <td className="px-3 py-2">
-                            <input
-                              type="checkbox"
-                              checked={Boolean(item.barcode && selectedBarcodes.includes(item.barcode))}
-                              disabled={!item.barcode}
-                              onChange={() => item.barcode && toggleBarcode(item.barcode)}
-                              className="h-4 w-4"
-                            />
-                          </td>
+                          {marketplace === 'TRENDYOL' && (
+                            <td className="px-3 py-2">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(item.barcode && selectedBarcodes.includes(item.barcode))}
+                                disabled={!item.barcode}
+                                onChange={() => item.barcode && toggleBarcode(item.barcode)}
+                                className="h-4 w-4"
+                              />
+                            </td>
+                          )}
                           <td className="px-3 py-2 text-gray-200">
                             <div className="line-clamp-1 max-w-xl">{item.name || '-'}</div>
                             {item.code && <div className="text-xs text-gray-500 mt-0.5">{item.code}</div>}
@@ -504,8 +512,7 @@ export default function MarketplacesPage() {
               </div>
             </div>
           )}
-        </div>
-      )}
+      </div>
 
       <div className="grid grid-cols-4 gap-3 mb-5">
         {MARKETPLACES.map(mp => (
@@ -659,11 +666,29 @@ export default function MarketplacesPage() {
           </table>
         </div>
 
-        {data && data.meta.total > limit && (
+        {data && data.meta.total > 0 && (
           <div className="flex items-center justify-between px-4 py-3 border-t border-gray-800">
-            <span className="text-xs text-gray-500">
-              {(page - 1) * limit + 1} - {Math.min(page * limit, data.meta.total)} / {data.meta.total}
-            </span>
+            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500">
+              <span>
+                {(page - 1) * pageSize + 1} - {Math.min(page * pageSize, data.meta.total)} / {data.meta.total}
+              </span>
+              <label className="flex items-center gap-2">
+                <span>Sayfada</span>
+                <select
+                  value={pageSize}
+                  onChange={e => {
+                    setPageSize(Number(e.target.value))
+                    setPage(1)
+                  }}
+                  className="bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs text-gray-100 focus:outline-none focus:border-blue-500"
+                >
+                  {PAGE_SIZE_OPTIONS.map(size => (
+                    <option key={size} value={size}>{size}</option>
+                  ))}
+                </select>
+                <span>kayit</span>
+              </label>
+            </div>
             <div className="flex gap-2">
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}

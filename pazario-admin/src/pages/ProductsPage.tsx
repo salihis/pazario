@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
 import MarketplaceAttributeSections from '../components/MarketplaceAttributeSections'
+import ProductMediaEditor from '../components/ProductMediaEditor'
+import { Images } from 'lucide-react'
 
 interface Product {
   id: string
@@ -17,7 +19,8 @@ interface Product {
   variantParentKey?: string
   variantColor?: string
   variantTotal?: number
-  publishProductIds?: string[]
+    publishProductIds?: string[]
+    groupProductIds?: string[]
 }
 
 interface ProductMarketplaceListing {
@@ -69,6 +72,7 @@ interface ProductAttributeField {
   currentValue: string | string[] | boolean | null
   isValid: boolean
   validationError: string | null
+  systemManaged: boolean
 }
 
 interface ProductAttributeSchema {
@@ -131,9 +135,10 @@ interface AutoFillAttributesResult {
   skipped: { productId: string; reason: string }[]
 }
 
-const MARKETPLACES = ['TRENDYOL', 'N11', 'PAZARAMA']
+const MARKETPLACES = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA']
 const MARKETPLACE_BADGES = [
   { marketplace: 'TRENDYOL', label: 'TR' },
+  { marketplace: 'HEPSIBURADA', label: 'HB' },
   { marketplace: 'N11', label: 'N1' },
   { marketplace: 'PAZARAMA', label: 'PA' },
 ]
@@ -141,6 +146,11 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100]
 const STOCK_FILTERS = [
   { label: 'Stok esigi uygula', value: 'marketplace' },
   { label: 'Tum stoklar', value: 'all' },
+]
+const TRANSFER_STATUS_FILTERS = [
+  { label: 'Tum aktarim durumlari', value: '' },
+  { label: 'Gonderilmeye Hazir / Eksik', value: 'not_published' },
+  { label: 'Yayinda', value: 'published' },
 ]
 
 function marketplaceBadgeClass(status?: string | null) {
@@ -167,6 +177,7 @@ export default function ProductsPage() {
   const [sourceId, setSourceId] = useState('')
   const [stockFilter, setStockFilter] = useState('marketplace')
   const [minStock, setMinStock] = useState(6)
+  const [transferStatus, setTransferStatus] = useState('')
   const [socialMessage, setSocialMessage] = useState('')
   const [attributeProduct, setAttributeProduct] = useState<Product | null>(null)
   const [attributeMarketplace, setAttributeMarketplace] = useState('PAZARAMA')
@@ -181,9 +192,11 @@ export default function ProductsPage() {
   const [bulkResultFilter, setBulkResultFilter] = useState<'all' | 'missing' | 'ready' | 'published'>('all')
   const [bulkPreviewImage, setBulkPreviewImage] = useState<{ src: string; title: string } | null>(null)
   const [showBulkAttributeGroups, setShowBulkAttributeGroups] = useState(false)
+  const [mediaProductId, setMediaProductId] = useState<string | null>(null)
+  const [mediaProductIds, setMediaProductIds] = useState<string[]>([])
 
   const { data, isLoading } = useQuery<ProductsResponse>({
-    queryKey: ['products', page, pageSize, search, category, sourceId, stockFilter, minStock],
+    queryKey: ['products', page, pageSize, search, category, sourceId, stockFilter, minStock, publishMarketplace, transferStatus],
     queryFn: () =>
       api.get('/products', {
         params: {
@@ -194,18 +207,18 @@ export default function ProductsPage() {
           sourceId: sourceId || undefined,
           stockFilter,
           minStock: stockFilter === 'marketplace' ? minStock : undefined,
+          transferMarketplace: transferStatus ? publishMarketplace : undefined,
+          transferStatus: transferStatus || undefined,
         },
       }).then(r => r.data),
   })
 
   const { data: categories } = useQuery<{ data: CategoryOption[] }>({
-    queryKey: ['product-categories', sourceId, stockFilter, minStock],
+    queryKey: ['product-categories', sourceId],
     queryFn: () =>
       api.get('/products/categories', {
         params: {
           sourceId: sourceId || undefined,
-          stockFilter,
-          minStock: stockFilter === 'marketplace' ? minStock : undefined,
         },
       }).then(r => r.data),
   })
@@ -263,6 +276,7 @@ export default function ProductsPage() {
     mutationFn: async () => {
       const attrs = attributeSchema?.data.attributes ?? []
       const payload = attrs
+        .filter(attr => !attr.systemManaged)
         .map(attr => {
           const value = (attributeValues[attr.attributeId] ?? '').trim()
           if (!value) return null
@@ -569,12 +583,12 @@ export default function ProductsPage() {
   }
   const hasActionableIssue = (result: MarketplacePublishCheck) =>
     !result.canPublish && !isAlreadyPublishedOnly(result)
-  const missingBulkProductIds = bulkPublishCheck?.results
+  const missingBulkProductIds: string[] = Array.from(new Set<string>(bulkPublishCheck?.results
     .filter(hasActionableIssue)
-    .map(result => result.productId) ?? []
+    .flatMap(result => result.groupProductIds?.length ? result.groupProductIds : [result.productId]) ?? []))
   const alreadyPublishedBulkProductIds = bulkPublishCheck?.results
     .filter(isAlreadyPublishedOnly)
-    .map(result => result.productId) ?? []
+    .flatMap(result => result.publishProductIds?.length ? result.publishProductIds : [result.productId]) ?? []
   const visibleBulkResults = bulkPublishCheck?.results.filter(result => {
     if (bulkResultFilter === 'missing') return hasActionableIssue(result)
     if (bulkResultFilter === 'ready') return result.canPublish
@@ -588,7 +602,11 @@ export default function ProductsPage() {
     })
     .reduce<Record<string, BulkAttributeGroup>>((acc, result) => {
       const key = `${result.marketplace}|${result.sourceId ?? ''}|${result.categoryRaw ?? ''}`
-      const targetIds = result.publishProductIds?.length ? result.publishProductIds : [result.productId]
+      const targetIds = result.groupProductIds?.length
+        ? result.groupProductIds
+        : result.publishProductIds?.length
+          ? result.publishProductIds
+          : [result.productId]
       if (!acc[key]) {
         acc[key] = {
           key,
@@ -613,8 +631,8 @@ export default function ProductsPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold">Urunler</h1>
-          <p className="text-gray-400 text-sm mt-1">
-            {groupedTotal} renk grubu / {rawTotal} varyant
+          <p className="text-slate-600 text-sm mt-1">
+            {groupedTotal} varyant grubu / {rawTotal} varyant
           </p>
         </div>
       </div>
@@ -627,14 +645,14 @@ export default function ProductsPage() {
 
       <div className="grid gap-3 md:grid-cols-4 mb-5">
         {[
-          { label: 'Renk Grubu', value: groupedTotal, color: 'text-blue-300', bg: 'bg-blue-900/20' },
-          { label: 'Secili Urunler', value: selectedProductIds.length, color: 'text-green-300', bg: 'bg-green-900/20' },
-          { label: `${publishMarketplace} Yayinda`, value: publishedCount, color: 'text-emerald-300', bg: 'bg-emerald-900/20' },
-          { label: 'Yuklenmemis', value: missingCount, color: 'text-yellow-300', bg: 'bg-yellow-900/20' },
+          { label: 'Renk Grubu', value: groupedTotal, color: 'text-blue-800', bg: 'bg-blue-100/70' },
+          { label: 'Secili Urunler', value: selectedProductIds.length, color: 'text-green-800', bg: 'bg-green-100/70' },
+          { label: `${publishMarketplace} Yayinda`, value: publishedCount, color: 'text-emerald-800', bg: 'bg-emerald-100/70' },
+          { label: 'Yuklenmemis', value: missingCount, color: 'text-amber-800', bg: 'bg-amber-100/70' },
         ].map(card => (
           <div key={card.label} className={`rounded-2xl border border-gray-800 px-4 py-3 ${card.bg}`}>
             <div className={`text-3xl font-bold ${card.color}`}>{card.value}</div>
-            <div className="text-xs text-gray-500 mt-1">{card.label}</div>
+            <div className="text-xs font-medium text-slate-700 mt-1">{card.label}</div>
           </div>
         ))}
       </div>
@@ -707,7 +725,7 @@ export default function ProductsPage() {
             />
           </label>
         )}
-        {(search || category || sourceId || stockFilter !== 'marketplace' || minStock !== 6) && (
+        {(search || category || sourceId || stockFilter !== 'marketplace' || minStock !== 6 || transferStatus) && (
           <button
             onClick={() => {
               setSearch('')
@@ -716,6 +734,7 @@ export default function ProductsPage() {
               setSourceId('')
               setStockFilter('marketplace')
               setMinStock(6)
+              setTransferStatus('')
               setSelectedProductIds([])
               setBulkPublishCheck(null)
               setPage(1)
@@ -727,11 +746,31 @@ export default function ProductsPage() {
         )}
         <select
           value={publishMarketplace}
-          onChange={e => setPublishMarketplace(e.target.value)}
+          onChange={e => {
+            setPublishMarketplace(e.target.value)
+            setPage(1)
+            setSelectedProductIds([])
+            setBulkPublishCheck(null)
+          }}
           className="w-44 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
         >
           {MARKETPLACES.map(mp => (
             <option key={mp} value={mp}>{mp}</option>
+          ))}
+        </select>
+        <select
+          value={transferStatus}
+          onChange={e => {
+            setTransferStatus(e.target.value)
+            setPage(1)
+            setSelectedProductIds([])
+            setBulkPublishCheck(null)
+          }}
+          className="w-60 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+          aria-label="Aktarim durumu"
+        >
+          {TRANSFER_STATUS_FILTERS.map(filter => (
+            <option key={filter.value} value={filter.value}>{filter.label}</option>
           ))}
         </select>
         <button
@@ -740,7 +779,7 @@ export default function ProductsPage() {
             bulkMarketplaceCheck.mutate(selectedProductIds)
           }}
           disabled={bulkMarketplaceCheck.isPending || selectedProductIds.length === 0}
-          className="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+          className="bg-indigo-700 hover:bg-indigo-600 disabled:bg-slate-600 disabled:text-slate-100 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
         >
           {bulkMarketplaceCheck.isPending ? 'Kontrol ediliyor...' : `Toplu Kontrol (${selectedProductIds.length})`}
         </button>
@@ -811,12 +850,21 @@ export default function ProductsPage() {
                     {/* Gorsel */}
                     <td className="px-4 py-3">
                       {product.images[0] ? (
-                        <img
-                          src={product.images[0]}
-                          alt={product.title}
-                          className="w-10 h-10 object-cover rounded-lg bg-gray-800"
-                          onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
-                        />
+                        <div
+                          className="inline-flex"
+                          onMouseEnter={() => setBulkPreviewImage({ src: product.images[0] as string, title: product.title })}
+                          onMouseLeave={() => setBulkPreviewImage(null)}
+                        >
+                          <img
+                            src={product.images[0]}
+                            alt={product.title}
+                            className="w-10 h-10 cursor-zoom-in object-cover rounded-lg bg-gray-800 transition-transform hover:scale-105"
+                            onError={e => {
+                              (e.target as HTMLImageElement).style.display = 'none'
+                              setBulkPreviewImage(null)
+                            }}
+                          />
+                        </div>
                       ) : (
                         <div className="w-10 h-10 bg-gray-800 rounded-lg flex items-center justify-center text-gray-600 text-xs">
                           YOK
@@ -897,6 +945,10 @@ export default function ProductsPage() {
                       >
                         Ozellikler
                       </button>
+                      <button onClick={() => { setMediaProductId(product.id); setMediaProductIds(productTargetIds) }} title="Gorseller ve Video" aria-label={`${product.sku} gorseller ve video`}
+                        className="ml-2 inline-flex h-8 w-8 items-center justify-center rounded border border-gray-600 bg-gray-800 text-white hover:bg-gray-700">
+                        <Images size={16} />
+                      </button>
                     </td>
 
                     {/* Sosyal Medya */}
@@ -933,6 +985,10 @@ export default function ProductsPage() {
         {paginationControls}
       </div>
 
+      {mediaProductId && <ProductMediaEditor productId={mediaProductId} productIds={mediaProductIds} onClose={() => setMediaProductId(null)} onSaved={() => {
+        queryClient.invalidateQueries({ queryKey: ['products'] })
+        queryClient.invalidateQueries({ queryKey: ['product-attribute-schema'] })
+      }} />}
       {bulkPublishCheck && (
         <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4">
           <div className="w-full max-w-5xl max-h-[88vh] bg-gray-950 border border-gray-800 rounded-lg overflow-hidden flex flex-col">
@@ -940,7 +996,7 @@ export default function ProductsPage() {
               <div>
                 <h2 className="text-lg font-bold text-gray-100">Toplu Gonderim Kontrolu</h2>
                 <div className="text-xs text-gray-500 mt-1">
-                  {bulkPublishCheck.marketplace} | {bulkPublishCheck.requested} varyant istendi, {bulkPublishCheck.checked} renk grubu kontrol edildi, {bulkPublishCheck.ready} hazir, {missingBulkProductIds.length} duzeltilecek eksik
+                  {bulkPublishCheck.marketplace} | {bulkPublishCheck.requested} varyant istendi, {bulkPublishCheck.checked} varyant grubu kontrol edildi, {bulkPublishCheck.ready} hazir, {missingBulkProductIds.length} duzeltilecek eksik
                   {alreadyPublishedBulkProductIds.length > 0 && `, ${alreadyPublishedBulkProductIds.length} zaten yayinda`}
                   {bulkPublishCheck.hiddenStockInsufficient > 0 && `, ${bulkPublishCheck.hiddenStockInsufficient} stok yetersiz gizlendi`}
                 </div>
@@ -1206,19 +1262,19 @@ export default function ProductsPage() {
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
 
-            {bulkPreviewImage && (
-              <div className="pointer-events-none fixed right-8 top-24 z-[100] max-w-xs rounded-xl border border-gray-700 bg-gray-950 p-2 shadow-2xl shadow-black/80">
-                <img
-                  src={bulkPreviewImage.src}
-                  alt=""
-                  className="h-72 w-72 rounded-lg bg-gray-900 object-contain"
-                />
-                <div className="mt-2 line-clamp-2 px-1 text-xs text-gray-300">
-                  {bulkPreviewImage.title}
-                </div>
-              </div>
-            )}
+      {bulkPreviewImage && (
+        <div className="pointer-events-none fixed right-8 top-24 z-[100] max-w-xs rounded-xl border border-gray-700 bg-gray-950 p-2 shadow-2xl shadow-black/80">
+          <img
+            src={bulkPreviewImage.src}
+            alt=""
+            className="h-72 w-72 rounded-lg bg-gray-900 object-contain"
+          />
+          <div className="mt-2 line-clamp-2 px-1 text-xs text-gray-300">
+            {bulkPreviewImage.title}
           </div>
         </div>
       )}
@@ -1286,7 +1342,7 @@ export default function ProductsPage() {
                     {publishCheck.existingListingStatus === 'PUBLISHED'
                       ? `Bu urun ${publishCheck.marketplace} uzerinde yayinda. Duzeltmeleri pazaryerine aktarmak icin Guncelle butonunu kullanin.`
                       : publishCheck.canPublish
-                        ? 'Bu urun gonderim icin hazir. Gonder butonuyla pazaryerine aktarabilirsiniz.'
+                        ? `Bu grup gonderim icin hazir. ${publishCheck.readyVariantCount}/${publishCheck.variantTotal} varyant pazaryerine aktarilacak.`
                         : 'Bu urun henuz gonderime hazir degil. Eksikleri tamamlayin.'}
                   </div>
 
@@ -1324,7 +1380,7 @@ export default function ProductsPage() {
                       </button>
                       <button
                         onClick={() => submitMarketplacePublish.mutate({
-                          productIds: [publishCheck.productId],
+                          productIds: publishCheck.publishProductIds?.length ? publishCheck.publishProductIds : [publishCheck.productId],
                           force: publishCheck.existingListingStatus === 'PUBLISHED',
                         })}
                         disabled={submitMarketplacePublish.isPending}
@@ -1332,7 +1388,7 @@ export default function ProductsPage() {
                       >
                         {submitMarketplacePublish.isPending
                           ? publishCheck.existingListingStatus === 'PUBLISHED' ? 'Guncelleniyor...' : 'Gonderiliyor...'
-                          : publishCheck.existingListingStatus === 'PUBLISHED' ? 'Guncelle' : 'Gonder'}
+                          : publishCheck.existingListingStatus === 'PUBLISHED' ? `Varyant Grubunu Duzelt (${publishCheck.publishProductIds?.length || 1})` : `Gonder (${publishCheck.publishProductIds?.length || 1})`}
                       </button>
                     </div>
                   )}
@@ -1374,7 +1430,7 @@ export default function ProductsPage() {
                 }}
                 className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
               >
-                {MARKETPLACES.filter(mp => mp !== 'HEPSIBURADA').map(mp => (
+                {MARKETPLACES.map(mp => (
                   <option key={mp} value={mp}>{mp}</option>
                 ))}
               </select>

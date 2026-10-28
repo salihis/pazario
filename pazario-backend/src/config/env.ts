@@ -7,6 +7,10 @@ if (!process.env.JWT_PUBLIC_KEY && process.env.JWT_PUBLIC_KEY_FILE) {
   process.env.JWT_PUBLIC_KEY = readFileSync(process.env.JWT_PUBLIC_KEY_FILE, 'utf8')
 }
 
+if (!process.env.JWT_PRIVATE_KEY && process.env.JWT_PRIVATE_KEY_FILE) {
+  process.env.JWT_PRIVATE_KEY = readFileSync(process.env.JWT_PRIVATE_KEY_FILE, 'utf8')
+}
+
 const optionalString = z.preprocess(value => value === '' ? undefined : value, z.string().optional())
 const optionalUrl = z.preprocess(value => value === '' ? undefined : value, z.string().url().optional())
 
@@ -17,7 +21,10 @@ const envSchema = z.object({
   REDIS_URL: z.string().min(1).default('redis://localhost:6379'),
   /** RS256 public key (PEM) — JWT doğrulaması için */
   JWT_PUBLIC_KEY: z.string().min(1),
+  JWT_PRIVATE_KEY: z.string().min(1),
   JWT_PUBLIC_KEY_FILE: z.string().optional(),
+  JWT_PRIVATE_KEY_FILE: z.string().optional(),
+  JWT_EXPIRES_IN: z.string().default('8h'),
   ALLOWED_ORIGINS: z
     .string()
     .default(
@@ -26,6 +33,9 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
   ANTHROPIC_API_KEY: optionalString,
   FIELD_ENCRYPTION_KEY: optionalString,
+  LOCAL_AGENT_SYNC_TOKEN: optionalString,
+  PUBLIC_BASE_URL: z.string().url().default('http://localhost:3000'),
+  INVOICE_STORAGE_DIR: z.string().default('./invoices'),
   // Trendyol
   TY_API_KEY: optionalString,
   TY_API_SECRET: optionalString,
@@ -35,7 +45,20 @@ const envSchema = z.object({
   N11_APPSECRET: optionalString,
   // Hepsiburada
   HB_MERCHANT_ID: optionalString,
+  HB_USERNAME: optionalString,
+  HB_PASSWORD: optionalString,
+  HB_USER_AGENT: optionalString,
+  HB_DEVELOPER_USERNAME: optionalString,
   HB_SERVICE_KEY: optionalString,
+  HB_ENVIRONMENT: z.enum(['sit', 'test', 'prod', 'production', 'live']).optional(),
+  HEPSIBURADA_ENVIRONMENT: z.enum(['sit', 'test', 'prod', 'production', 'live']).optional(),
+  HB_PRODUCT_API_BASE_URL: optionalUrl,
+  HEPSIBURADA_PRODUCT_API_BASE_URL: optionalUrl,
+  HB_LISTING_API_BASE_URL: optionalUrl,
+  HEPSIBURADA_LISTING_API_BASE_URL: optionalUrl,
+  HB_ORDER_API_BASE_URL: optionalUrl,
+  HEPSIBURADA_ORDER_API_BASE_URL: optionalUrl,
+  HB_ORDER_STUB_API_BASE_URL: optionalUrl,
   // Pazarama
   PZ_CLIENT_ID: optionalString,
   PZ_CLIENT_SECRET: optionalString,

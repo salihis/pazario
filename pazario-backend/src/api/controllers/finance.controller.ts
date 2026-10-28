@@ -1,6 +1,10 @@
 import { Request, Response } from 'express'
 import { Marketplace, Prisma, PrismaClient } from '@prisma/client'
 import axios from 'axios'
+import { calculatePurchaseCost } from '../../services/PurchaseCostService'
+import { allocateAccounting, calculateFinanceRow, sumRows, type FinanceTransaction } from '../../services/FinanceAccounting'
+import { financeCredential, syncHepsiburadaFinance } from '../../services/HepsiburadaFinanceService'
+export { sumRows, type FinanceRow } from '../../services/FinanceAccounting'
 
 const prisma = new PrismaClient()
 const MARKETPLACES: Marketplace[] = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA']
@@ -16,46 +20,23 @@ const startOfDay = (date: Date) => {
 
 const startOfMonth = (date: Date) => new Date(date.getFullYear(), date.getMonth(), 1)
 
-type FinanceRow = {
-  productId?: string | null
-  quantity: number
-  totalPrice: unknown
-  shippingFee: unknown
-  serviceFee: unknown
-  extraFees: unknown
-}
-
 const getProductPriceMap = async (productIds: string[]) => {
   if (productIds.length === 0) return new Map<string, number>()
   const products = await prisma.product.findMany({
     where: { id: { in: productIds } },
-    select: { id: true, price: true },
+    select: {
+      id: true,
+      price: true,
+      source: {
+        select: {
+          priceIncludesVat: true,
+          purchaseVatRate: true,
+          purchaseExtraFee: true,
+        },
+      },
+    },
   })
-  return new Map(products.map(product => [product.id, toNumber(product.price)]))
-}
-
-const sumRows = (rows: FinanceRow[], productPriceById = new Map<string, number>()) => {
-  const sales = rows.reduce((sum, row) => sum + toNumber(row.totalPrice), 0)
-  const purchase = rows.reduce((sum, row) => {
-    if (!row.productId) return sum
-    const unitPurchasePrice = productPriceById.get(row.productId)
-    return unitPurchasePrice === undefined ? sum : sum + unitPurchasePrice * row.quantity
-  }, 0)
-  const missingPurchase = rows.filter(row => row.productId && !productPriceById.has(row.productId)).length
-  const shipping = rows.reduce((sum, row) => sum + toNumber(row.shippingFee), 0)
-  const service = rows.reduce((sum, row) => sum + toNumber(row.serviceFee), 0)
-  const extra = rows.reduce((sum, row) => sum + toNumber(row.extraFees), 0)
-  return {
-    orders: rows.length,
-    sales,
-    purchase,
-    shipping,
-    service,
-    extra,
-    net: sales - shipping - service - extra,
-    profit: sales - purchase - shipping - service - extra,
-    missingPurchase,
-  }
+  return new Map(products.map(product => [product.id, calculatePurchaseCost(product.price, product.source)]))
 }
 
 const parseMoneyInput = (value: unknown) => {
@@ -65,6 +46,11 @@ const parseMoneyInput = (value: unknown) => {
     throw new Error('Gecersiz tutar')
   }
   return Math.round(parsed * 100) / 100
+}
+
+const parseOptionalMoneyInput = (value: unknown) => {
+  if (value === null || value === undefined || value === '') return null
+  return parseMoneyInput(value)
 }
 
 interface TrendyolCargoInvoiceItem {
@@ -189,126 +175,114 @@ async function applyTrendyolCargoAmounts(items: ReturnType<typeof normalizeCargo
   }
 }
 
+const financeOrderSelect = {
+  id: true, marketplace: true, marketplaceOrderNo: true, marketplaceOrderId: true,
+  createdAt: true, orderedAt: true, status: true,
+} satisfies Prisma.OrderSelect
+
+function orderDateWhere(from: Date, to: Date): Prisma.OrderWhereInput {
+  return { OR: [{ orderedAt: { gte: from, lte: to } }, { orderedAt: null, createdAt: { gte: from, lte: to } }] }
+}
+
 export async function getFinanceOverview(req: Request, res: Response) {
   try {
-    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10))
-    const limit = Math.min(100, Math.max(10, parseInt(String(req.query.limit || '50'), 10)))
-    const marketplaceParam = req.query.marketplace ? String(req.query.marketplace) : undefined
-    const marketplace = MARKETPLACES.includes(marketplaceParam as Marketplace)
-      ? marketplaceParam as Marketplace
-      : undefined
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 50))
+    const marketplace = MARKETPLACES.includes(req.query.marketplace as Marketplace) ? req.query.marketplace as Marketplace : undefined
     const sourceId = req.query.sourceId ? String(req.query.sourceId) : undefined
     const startDate = req.query.startDate ? new Date(String(req.query.startDate)) : startOfMonth(new Date())
     const endDate = req.query.endDate ? new Date(String(req.query.endDate)) : new Date()
     endDate.setHours(23, 59, 59, 999)
-
-    const where: Prisma.OrderItemWhereInput = {
-      order: {
-        createdAt: { gte: startDate, lte: endDate },
-        ...(marketplace ? { marketplace } : {}),
-      },
-      ...(sourceId ? { sourceId } : {}),
+    if (!Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime()) || startDate > endDate) {
+      res.status(400).json({ success: false, error: 'Gecersiz tarih araligi' })
+      return
     }
-
-    const scopedOrderWhere = (from: Date, to: Date): Prisma.OrderItemWhereInput => ({
-      ...where,
-      order: {
-        createdAt: { gte: from, lte: to },
-        ...(marketplace ? { marketplace } : {}),
+    const now = new Date()
+    const weekStart = new Date(now.getTime() - 7 * 86400000)
+    const monthStart = startOfMonth(now)
+    const earliest = new Date(Math.min(startDate.getTime(), weekStart.getTime(), monthStart.getTime()))
+    const latest = new Date(Math.max(endDate.getTime(), now.getTime()))
+    const rows = await prisma.orderItem.findMany({
+      where: {
+        order: { ...orderDateWhere(earliest, latest), ...(marketplace ? { marketplace } : {}) },
+        ...(sourceId ? { sourceId } : {}),
+      },
+      include: {
+        order: { select: financeOrderSelect },
+        source: { select: { id: true, name: true } },
       },
     })
-
-    const [items, total, allRangeItems, todayItems, weekItems, monthItems] = await Promise.all([
-      prisma.orderItem.findMany({
-        where,
-        skip: (page - 1) * limit,
-        take: limit,
-        orderBy: { order: { createdAt: 'desc' } },
-        include: {
-          order: {
-            select: {
-              id: true,
-              marketplace: true,
-              marketplaceOrderNo: true,
-              marketplaceOrderId: true,
-              createdAt: true,
-              status: true,
-            },
-          },
-          source: { select: { id: true, name: true, url: true } },
-        },
-      }),
-      prisma.orderItem.count({ where }),
-      prisma.orderItem.findMany({ where, select: { productId: true, quantity: true, totalPrice: true, shippingFee: true, serviceFee: true, extraFees: true } }),
-      prisma.orderItem.findMany({
-        where: scopedOrderWhere(startOfDay(new Date()), new Date()),
-        select: { productId: true, quantity: true, totalPrice: true, shippingFee: true, serviceFee: true, extraFees: true },
-      }),
-      prisma.orderItem.findMany({
-        where: scopedOrderWhere(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), new Date()),
-        select: { productId: true, quantity: true, totalPrice: true, shippingFee: true, serviceFee: true, extraFees: true },
-      }),
-      prisma.orderItem.findMany({
-        where: scopedOrderWhere(startOfMonth(new Date()), new Date()),
-        select: { productId: true, quantity: true, totalPrice: true, shippingFee: true, serviceFee: true, extraFees: true },
-      }),
-    ])
-
-    const productIds = Array.from(new Set([
-      ...items.map(item => item.productId),
-      ...allRangeItems.map(item => item.productId),
-      ...todayItems.map(item => item.productId),
-      ...weekItems.map(item => item.productId),
-      ...monthItems.map(item => item.productId),
-    ].filter(Boolean))) as string[]
-    const productPriceById = await getProductPriceMap(productIds)
-
-    res.json({
-      success: true,
-      data: {
-        items: items.map(item => {
-          const sales = toNumber(item.totalPrice)
-          const unitPurchasePrice = item.productId ? productPriceById.get(item.productId) ?? null : null
-          const purchase = unitPurchasePrice === null ? null : unitPurchasePrice * item.quantity
-          const shipping = toNumber(item.shippingFee)
-          const service = toNumber(item.serviceFee)
-          const extra = toNumber(item.extraFees)
-          return {
-            id: item.id,
-            orderId: item.orderId,
-            orderNo: item.order.marketplaceOrderNo ?? item.order.marketplaceOrderId,
-            orderDate: item.order.createdAt,
-            orderStatus: item.order.status,
-            marketplace: item.order.marketplace,
-            productId: item.productId,
-            sourceId: item.sourceId,
-            sourceName: item.source?.name ?? 'Eslesmedi',
-            sku: item.sku,
-            title: item.title,
-            quantity: item.quantity,
-            unitPrice: toNumber(item.unitPrice),
-            unitPurchasePrice,
-            purchase,
-            sales,
-            shipping,
-            service,
-            extra,
-            net: sales - shipping - service - extra,
-            grossProfit: purchase === null ? null : sales - purchase,
-            profit: purchase === null ? null : sales - purchase - shipping - service - extra,
-          }
-        }),
-        summary: {
-          selectedRange: sumRows(allRangeItems, productPriceById),
-          today: sumRows(todayItems, productPriceById),
-          week: sumRows(weekItems, productPriceById),
-          month: sumRows(monthItems, productPriceById),
-        },
-        meta: { total, page, limit },
-      },
+    const orderNumbers = [...new Set(rows.filter(r => r.order.marketplace === 'HEPSIBURADA')
+      .map(r => r.order.marketplaceOrderNo).filter((v): v is string => Boolean(v)))]
+    const credential = orderNumbers.length ? await financeCredential(prisma).catch(() => null) : null
+    const snapshots = credential ? await prisma.marketplaceFinanceSnapshot.findMany({
+      where: { marketplace: 'HEPSIBURADA', environment: credential.environment,
+        merchantId: credential.merchantId, orderNumber: { in: orderNumbers } },
+    }) : []
+    // Include all siblings, even outside the selected XML source, to prevent double allocation.
+    const siblings = snapshots.length ? await prisma.orderItem.findMany({
+      where: { order: { marketplace: 'HEPSIBURADA', marketplaceOrderNo: { in: snapshots.map(s => s.orderNumber) } } },
+      include: { order: { select: financeOrderSelect } },
+    }) : []
+    const accountingByItem = new Map<string, ReturnType<typeof allocateAccounting> extends Map<string, infer V> ? V : never>()
+    const snapshotByOrder = new Map(snapshots.map(s => [s.orderNumber, s]))
+    for (const snapshot of snapshots) {
+      const allocations = allocateAccounting(
+        siblings.filter(i => i.order.marketplaceOrderNo === snapshot.orderNumber),
+        snapshot.transactions as unknown as FinanceTransaction[],
+      )
+      for (const [id, value] of allocations) accountingByItem.set(id, value)
+    }
+    const enriched = rows.map(row => {
+      const snapshot = row.order.marketplace === 'HEPSIBURADA'
+        ? snapshotByOrder.get(row.order.marketplaceOrderNo || '') : undefined
+      return { ...row, accounting: accountingByItem.get(row.id),
+        accountingSyncedAt: snapshot?.syncedAt, accountingError: snapshot?.lastError }
     })
-  } catch (e) {
+    const prices = await getProductPriceMap([...new Set(rows.map(r => r.productId).filter((v): v is string => Boolean(v)))])
+    const inRange = (from: Date, to: Date) => enriched.filter(r => {
+      const date = r.order.orderedAt ?? r.order.createdAt
+      return date >= from && date <= to
+    })
+    const selected = inRange(startDate, endDate).sort((a, b) =>
+      (b.order.orderedAt ?? b.order.createdAt).getTime() - (a.order.orderedAt ?? a.order.createdAt).getTime()
+      || a.id.localeCompare(b.id))
+    res.json({ success: true, data: {
+      items: selected.slice((page - 1) * limit, page * limit).map(item => ({
+        id: item.id, orderId: item.orderId,
+        orderNo: item.order.marketplaceOrderNo ?? item.order.marketplaceOrderId,
+        orderDate: item.order.orderedAt ?? item.order.createdAt, orderStatus: item.order.status,
+        marketplace: item.order.marketplace, productId: item.productId, sourceId: item.sourceId,
+        sourceName: item.source?.name ?? 'Eslesmedi', sku: item.sku, title: item.title,
+        quantity: item.quantity, unitPrice: toNumber(item.unitPrice),
+        ...calculateFinanceRow(item, prices),
+      })),
+      syncTargets: [...new Map(selected.filter(r => r.order.marketplace === 'HEPSIBURADA' && r.order.marketplaceOrderNo)
+        .map(r => [r.order.marketplaceOrderNo, { orderId: r.orderId, orderNumber: r.order.marketplaceOrderNo }])).values()],
+      summary: {
+        selectedRange: sumRows(selected, prices),
+        today: sumRows(inRange(startOfDay(now), now), prices),
+        week: sumRows(inRange(weekStart, now), prices),
+        month: sumRows(inRange(monthStart, now), prices),
+      },
+      meta: { total: selected.length, page, limit },
+    } })
+  } catch {
     res.status(500).json({ success: false, error: 'Finans verisi alinamadi' })
+  }
+}
+
+export async function syncFinanceOrder(req: Request, res: Response) {
+  const orderId = String(req.params.orderId || '')
+  if (!/^[0-9a-f-]{36}$/i.test(orderId)) {
+    res.status(400).json({ success: false, error: 'Gecersiz siparis kimligi' })
+    return
+  }
+  try {
+    const data = await syncHepsiburadaFinance(prisma, orderId)
+    res.json({ success: true, data })
+  } catch (error) {
+    res.status(502).json({ success: false, error: error instanceof Error ? error.message : 'Muhasebe guncellenemedi' })
   }
 }
 
@@ -323,10 +297,22 @@ export async function updateFinanceItemFees(req: Request, res: Response) {
     const shippingFee = parseMoneyInput(req.body?.shipping)
     const serviceFee = parseMoneyInput(req.body?.service)
     const extraFees = parseMoneyInput(req.body?.extra)
+    const hasManualPurchasePrice = Object.prototype.hasOwnProperty.call(
+      req.body ?? {},
+      'manualPurchasePrice',
+    )
+    const manualPurchasePrice = hasManualPurchasePrice
+      ? parseOptionalMoneyInput(req.body?.manualPurchasePrice)
+      : undefined
 
     const updated = await prisma.orderItem.update({
       where: { id: itemId },
-      data: { shippingFee, serviceFee, extraFees },
+      data: {
+        shippingFee,
+        serviceFee,
+        extraFees,
+        ...(hasManualPurchasePrice ? { manualPurchasePrice } : {}),
+      },
       include: {
         order: {
           select: {
@@ -345,6 +331,9 @@ export async function updateFinanceItemFees(req: Request, res: Response) {
         shipping: toNumber(updated.shippingFee),
         service: toNumber(updated.serviceFee),
         extra: toNumber(updated.extraFees),
+        manualPurchasePrice: updated.manualPurchasePrice === null
+          ? null
+          : toNumber(updated.manualPurchasePrice),
       },
     })
   } catch (e) {

@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import {
   archiveUnmatchedTrendyolListings,
+  getMarketplaceDailyReport,
   getMarketplaceListings,
   getMarketplaceStats,
   getMarketplaceSyncSettings,
@@ -18,6 +19,7 @@ const router = Router()
 
 router.get('/marketplace-listings', getMarketplaceListings)
 router.get('/marketplace-listings/stats', getMarketplaceStats)
+router.get('/marketplace-listings/daily-report', getMarketplaceDailyReport)
 router.get('/marketplace-listings/unmatched', getUnmatchedMarketplaceListings)
 router.post('/marketplace-listings/stock-sync', syncMarketplaceStock)
 router.post('/marketplace-listings/price-sync', syncMarketplacePrice)

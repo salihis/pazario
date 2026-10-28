@@ -78,6 +78,18 @@ function buildTrendyolProductPayload(product: TrendyolPublishProduct, includeSto
   return { error: null, payload: { items: [item] } }
 }
 
+function buildTrendyolProductsPayload(products: TrendyolPublishProduct[], includeStockAndPrice: boolean) {
+  const items = []
+  for (const product of products) {
+    const { payload, error } = buildTrendyolProductPayload(product, includeStockAndPrice)
+    if (!payload) {
+      return { error: `${product.sku || product.id}: ${error ?? 'Payload olusturulamadi'}`, payload: null }
+    }
+    items.push(payload.items[0])
+  }
+  return { error: null, payload: { items } }
+}
+
 function extractAxiosMessage(error: unknown): string {
   if (error instanceof Error) {
     const axiosErr = error as Error & { response?: { data?: unknown } }
@@ -157,6 +169,46 @@ export class TrendyolAdapter extends BaseAdapter {
     }, 1)
   }
 
+  async publishProducts(products: TrendyolPublishProduct[]): Promise<PublishResult> {
+    return this.retry(async () => {
+      await this.authenticate()
+
+      const { payload, error } = buildTrendyolProductsPayload(products, true)
+      const firstProduct = products[0]
+      if (!payload || !firstProduct) {
+        return {
+          success: false,
+          productId: firstProduct?.id ?? 'bulk',
+          message: 'Trendyol kategori ID eksik',
+          errors: [error ?? 'Kategori ID eksik'],
+        }
+      }
+
+      try {
+        const response = await this.client.post<TrendyolBatchResponse>(
+          `/sellers/${this.supplierId}/v2/products`,
+          payload
+        )
+        const batchRequestId = response.data?.batchRequestId ?? response.data?.id
+        return {
+          success: Boolean(batchRequestId),
+          listingId: batchRequestId,
+          productId: firstProduct.id,
+          message: batchRequestId
+            ? `Trendyol varyant batch olusturuldu: ${batchRequestId}`
+            : 'Trendyol batch cevabinda id yok',
+        }
+      } catch (error: unknown) {
+        return {
+          success: false,
+          productId: firstProduct.id,
+          message: 'Trendyol varyant grup gonderimi basarisiz',
+          errors: [extractAxiosMessage(error)],
+        }
+      }
+    }, 1)
+  }
+
   async updateProduct(product: TrendyolPublishProduct): Promise<PublishResult> {
     return this.retry(async () => {
       await this.authenticate()
@@ -190,6 +242,46 @@ export class TrendyolAdapter extends BaseAdapter {
           success: false,
           productId: product.id,
           message: 'Trendyol urun bilgisi guncelleme basarisiz',
+          errors: [extractAxiosMessage(error)],
+        }
+      }
+    }, 1)
+  }
+
+  async updateProducts(products: TrendyolPublishProduct[]): Promise<PublishResult> {
+    return this.retry(async () => {
+      await this.authenticate()
+
+      const { payload, error } = buildTrendyolProductsPayload(products, false)
+      const firstProduct = products[0]
+      if (!payload || !firstProduct) {
+        return {
+          success: false,
+          productId: firstProduct?.id ?? 'bulk',
+          message: 'Trendyol kategori ID eksik',
+          errors: [error ?? 'Kategori ID eksik'],
+        }
+      }
+
+      try {
+        const response = await this.client.put<TrendyolBatchResponse>(
+          `/sellers/${this.supplierId}/products`,
+          payload
+        )
+        const batchRequestId = response.data?.batchRequestId ?? response.data?.id
+        return {
+          success: Boolean(batchRequestId),
+          listingId: batchRequestId,
+          productId: firstProduct.id,
+          message: batchRequestId
+            ? `Trendyol varyant update batch olusturuldu: ${batchRequestId}`
+            : 'Trendyol updateProduct cevabinda id yok',
+        }
+      } catch (error: unknown) {
+        return {
+          success: false,
+          productId: firstProduct.id,
+          message: 'Trendyol varyant grup guncelleme basarisiz',
           errors: [extractAxiosMessage(error)],
         }
       }

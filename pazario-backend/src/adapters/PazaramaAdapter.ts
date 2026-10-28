@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { BaseAdapter, Product, PublishResult } from './BaseAdapter'
 import { transformMarketplaceProduct } from '../services/MarketplacePayloadTransform'
+import { logger } from '../utils/logger'
 
 type PazaramaPublishProduct = Product & {
   categoryId?: string | number
@@ -93,6 +94,11 @@ function normalizeProducts(data: unknown): PazaramaProductResponse[] {
 
 function extractResponseErrors(data: unknown): string[] {
   const root = data as any
+  const directCandidates = [
+    root?.error,
+    root?.data?.error,
+    root?.result?.error,
+  ]
   const candidates = [
     root?.errors,
     root?.data?.errors,
@@ -103,6 +109,24 @@ function extractResponseErrors(data: unknown): string[] {
     root?.products,
   ]
   const errors: string[] = []
+  for (const candidate of directCandidates) {
+    if (!candidate) continue
+    if (typeof candidate === 'string') {
+      errors.push(candidate)
+      continue
+    }
+    if (candidate?.message) errors.push(String(candidate.message))
+    if (candidate?.userMessage) errors.push(String(candidate.userMessage))
+    if (candidate?.errorMessage) errors.push(String(candidate.errorMessage))
+    if (Array.isArray(candidate?.errors)) errors.push(...candidate.errors.map(String))
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) {
+        if (typeof item === 'string') errors.push(item)
+        else if (item?.message) errors.push(String(item.message))
+        else if (item?.errorMessage) errors.push(String(item.errorMessage))
+      }
+    }
+  }
   for (const candidate of candidates) {
     if (!Array.isArray(candidate)) continue
     for (const item of candidate) {
@@ -115,6 +139,83 @@ function extractResponseErrors(data: unknown): string[] {
   const message = root?.message ?? root?.userMessage ?? root?.data?.message ?? root?.data?.userMessage
   if (root?.success === false && message) errors.push(String(message))
   return Array.from(new Set(errors.filter(Boolean)))
+}
+
+function readNestedString(root: any, paths: string[][]): string | undefined {
+  for (const path of paths) {
+    let current = root
+    for (const key of path) current = current?.[key]
+    if (current !== undefined && current !== null && String(current) !== '00000000-0000-0000-0000-000000000000') {
+      const value = String(current).trim()
+      if (value) return value
+    }
+  }
+  return undefined
+}
+
+function extractPazaramaBatchId(data: unknown): string | undefined {
+  const root = data as any
+  return readNestedString(root, [
+    ['batchRequestId'],
+    ['batchId'],
+    ['requestId'],
+    ['id'],
+    ['data', 'batchRequestId'],
+    ['data', 'batchId'],
+    ['data', 'requestId'],
+    ['data', 'id'],
+    ['result', 'batchRequestId'],
+    ['result', 'batchId'],
+    ['result', 'requestId'],
+    ['result', 'id'],
+    ['data', 'result', 'batchRequestId'],
+    ['data', 'result', 'batchId'],
+    ['data', 'result', 'requestId'],
+    ['data', 'result', 'id'],
+  ])
+}
+
+function summarizePazaramaResponse(data: unknown): string {
+  const root = data as any
+  const keys = root && typeof root === 'object' ? Object.keys(root).slice(0, 12) : []
+  const dataKeys = root?.data && typeof root.data === 'object' ? Object.keys(root.data).slice(0, 12) : []
+  const resultKeys = root?.result && typeof root.result === 'object' ? Object.keys(root.result).slice(0, 12) : []
+  const rawBatchId = root?.batchRequestId
+    ?? root?.data?.batchRequestId
+    ?? root?.result?.batchRequestId
+    ?? root?.data?.result?.batchRequestId
+  const message = root?.userMessage ?? root?.message ?? root?.data?.userMessage ?? root?.data?.message ?? root?.result?.message
+  const errors = extractResponseErrors(data).slice(0, 5)
+
+  return [
+    `keys=${keys.join(',') || '-'}`,
+    dataKeys.length ? `dataKeys=${dataKeys.join(',')}` : '',
+    resultKeys.length ? `resultKeys=${resultKeys.join(',')}` : '',
+    rawBatchId !== undefined && rawBatchId !== null ? `batchRequestId=${String(rawBatchId).slice(0, 160) || '<empty>'}` : '',
+    message ? `message=${String(message).slice(0, 300)}` : '',
+    errors.length ? `errors=${errors.join(' | ').slice(0, 500)}` : '',
+  ].filter(Boolean).join(' ; ')
+}
+
+function isAlreadyExistingProductMessage(message: string): boolean {
+  const normalized = message.toLocaleLowerCase('tr-TR')
+  return normalized.includes('ilgili satıcı için kaydı zaten mevcut')
+    || normalized.includes('ilgili satici icin kaydi zaten mevcut')
+    || normalized.includes('zaten mevcut')
+}
+
+function isDuplicateOperationMessage(message: string): boolean {
+  const normalized = message.toLocaleLowerCase('tr-TR')
+  return normalized.includes('tekrarlayan işlem') || normalized.includes('tekrarlayan islem')
+}
+
+function isAcceptedWithoutBatch(data: unknown, message: unknown, listingId: string | undefined, responseErrors: string[]): boolean {
+  const root = data as any
+  const normalizedMessage = String(message ?? '').toLocaleLowerCase('tr-TR')
+  return !listingId
+    && responseErrors.length === 0
+    && root?.success !== false
+    && normalizedMessage.includes('iletildi')
 }
 
 export class PazaramaAdapter extends BaseAdapter {
@@ -222,33 +323,61 @@ export class PazaramaAdapter extends BaseAdapter {
 
       try {
         const response = await withPazaramaRateLimitRetry(() => this.client.post(publishPath, payload))
-        const rawListingId = response.data?.batchRequestId
-          ?? response.data?.data?.batchRequestId
-          ?? response.data?.batchId
-          ?? response.data?.id
-          ?? response.data?.data?.id
-        const listingId = rawListingId && String(rawListingId) !== '00000000-0000-0000-0000-000000000000'
-          ? String(rawListingId)
-          : undefined
+        const listingId = extractPazaramaBatchId(response.data)
         const responseErrors = extractResponseErrors(response.data)
+        const responseSummary = summarizePazaramaResponse(response.data)
+        const existingProductMessage = responseErrors.find(isAlreadyExistingProductMessage)
+        const message = response.data?.userMessage || response.data?.message
+        if (existingProductMessage) {
+          return {
+            success: true,
+            listingId: publishProduct.barcode || publishProduct.sku,
+            productId: product.id,
+            message: `Pazarama urunu zaten mevcut, yayinda olarak eslestirildi: ${publishProduct.barcode || publishProduct.sku}`,
+          }
+        }
+        const duplicateOperationMessage = responseErrors.find(isDuplicateOperationMessage)
+        if (duplicateOperationMessage) {
+          return {
+            success: false,
+            productId: product.id,
+            message: 'Pazarama tekrarlayan islem reddi',
+            errors: ['Pazarama ayni urun icin yakin zamanda gonderim aldigi icin tekrar islemi reddetti. Bir sure bekleyip tekrar deneyin.'],
+          }
+        }
         const success = response.data?.success !== false
           && response.status >= 200
           && response.status < 300
-          && Boolean(listingId)
+          && (Boolean(listingId) || isAcceptedWithoutBatch(response.data, message, listingId, responseErrors))
           && responseErrors.length === 0
-        const message = response.data?.userMessage || response.data?.message
+        if (!listingId || responseErrors.length > 0) {
+          logger.warn(
+            { productId: product.id, sku: publishProduct.sku, barcode: publishProduct.barcode, responseSummary },
+            'Pazarama urun ekleme cevabi batch id veya validasyon hatasi iceriyor'
+          )
+        }
         return {
           success,
           listingId,
           productId: product.id,
           message: listingId
             ? `Pazarama urun gonderimi kabul edildi: ${listingId}`
-            : message || 'Pazarama batchRequestId donmedi',
+            : success
+              ? 'Pazarama urun gonderimi kabul edildi, batchRequestId donmedi; pazaryeri onay sureci bekleniyor.'
+              : message || 'Pazarama batchRequestId donmedi',
           errors: responseErrors.length > 0
             ? responseErrors
-            : listingId ? undefined : ['Pazarama urun ekleme cevabinda batchRequestId yok.'],
+            : listingId || success ? undefined : [`Pazarama urun ekleme cevabinda batchRequestId yok. ${responseSummary}`],
         }
       } catch (error: unknown) {
+        if (axiosStatus(error) === 429) {
+          return {
+            success: false,
+            productId: product.id,
+            message: 'Pazarama rate limit',
+            errors: ['Pazarama API 429 rate limit dondu. Gonderim yavaslatildi; bir sure bekleyip daha kucuk paketle tekrar deneyin.'],
+          }
+        }
         return {
           success: false,
           productId: product.id,

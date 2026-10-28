@@ -5,8 +5,15 @@ import { Request, Response } from 'express'
 import { MIN_MARKETPLACE_STOCK } from '../../validators/ProductValidator'
 import { marketplaceBarcode } from '../../services/MarketplacePayloadTransform'
 import { roundUpToNinetyNine } from '../../services/PriceEngine'
+import { calculatePurchaseCost, type PurchaseCostSource } from '../../services/PurchaseCostService'
+import { decryptJson } from '../../services/FieldEncryptionService'
+import { logger } from '../../utils/logger'
+import { OperationHistoryService } from '../../services/OperationHistoryService'
+import { hepsiburadaAuthHeaders, hepsiburadaListingApiUrl } from '../../config/hepsiburada'
+import { HepsiburadaAdapter } from '../../adapters/HepsiburadaAdapter'
 
 const prisma = new PrismaClient()
+const operationService = new OperationHistoryService(prisma)
 const MARKETPLACES: Marketplace[] = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA']
 const PAZARAMA_TOKEN_URL = 'https://isortagimgiris.pazarama.com/connect/token'
 const PAZARAMA_PRODUCTS_URL = 'https://isortagimapi.pazarama.com/product/products'
@@ -19,6 +26,7 @@ const N11_STOCK_URL = 'https://api.n11.com/ms/product/tasks/price-stock-update'
 
 type MarketplaceProduct = {
   [key: string]: any
+  listingId?: string | number | null
   id?: string | number | null
   productId?: string | number | null
   n11ProductId?: string | number | null
@@ -66,11 +74,33 @@ type StockUpdateItem = {
 
 type MarketplaceUpdateMode = 'stock' | 'price' | 'stock-price'
 
+export class MarketplaceSyncDeferredError extends Error {
+  constructor(message: string, public readonly retryAfterMs: number) {
+    super(message)
+    this.name = 'MarketplaceSyncDeferredError'
+  }
+}
+
 type ProductMatchRecord = Pick<Product, 'id' | 'sku' | 'barcode' | 'externalId' | 'title' | 'contentHash'>
 
 type ProductMatcher = {
   byKey: Map<string, ProductMatchRecord>
   byTitle: Map<string, ProductMatchRecord>
+}
+
+type MarketplaceDailyReportRow = {
+  marketplace: Marketplace
+  enabled: boolean
+  scheduleTime: string | null
+  scanned: number
+  prepared: number
+  updated: number
+  skipped: number
+  failed: number
+  operations: number
+  lastOperationAt: Date | null
+  nextBatchAt: Date | null
+  inProgress: boolean
 }
 
 type LivePriceRule = {
@@ -88,6 +118,56 @@ type LivePriceRule = {
 }
 
 let pazaramaTokenCache: { token: string; expiresAt: number } | null = null
+
+type MarketplaceCredentialValues = Record<string, string>
+
+async function activeMarketplaceCredentials(marketplace: Marketplace): Promise<MarketplaceCredentialValues> {
+  const record = await prisma.marketplaceCredential.findUnique({ where: { marketplace } })
+  if (!record?.isActive) return {}
+  return decryptJson(record.credentialsEncrypted)
+}
+
+async function trendyolApiCredentials() {
+  const credentials = await activeMarketplaceCredentials('TRENDYOL')
+  return {
+    supplierId: cleanKey(credentials.supplierId || process.env.TY_SUPPLIER_ID),
+    apiKey: cleanKey(credentials.apiKey || process.env.TY_API_KEY),
+    apiSecret: cleanKey(credentials.apiSecret || process.env.TY_API_SECRET),
+  }
+}
+
+async function pazaramaApiCredentials() {
+  const credentials = await activeMarketplaceCredentials('PAZARAMA')
+  return {
+    clientId: cleanKey(credentials.clientId || process.env.PZ_CLIENT_ID),
+    clientSecret: cleanKey(credentials.clientSecret || process.env.PZ_CLIENT_SECRET),
+  }
+}
+
+async function n11ApiCredentials() {
+  const credentials = await activeMarketplaceCredentials('N11')
+  return {
+    appKey: cleanKey(credentials.appKey || process.env.N11_APPKEY),
+    appSecret: cleanKey(credentials.appSecret || process.env.N11_APPSECRET),
+  }
+}
+
+async function hepsiburadaApiCredentials() {
+  const credentials = await activeMarketplaceCredentials('HEPSIBURADA')
+  const merchantId = cleanKey(credentials.merchantId || process.env.HB_MERCHANT_ID)
+  const serviceKey = cleanKey(credentials.serviceKey || process.env.HB_SERVICE_KEY)
+  return {
+    merchantId,
+    username: merchantId,
+    password: cleanKey(serviceKey || credentials.password || process.env.HB_PASSWORD),
+    userAgent: cleanKey(credentials.userAgent || credentials.developerUsername || process.env.HB_USER_AGENT || process.env.HB_DEVELOPER_USERNAME),
+    serviceKey,
+  }
+}
+
+function hepsiburadaHeaders(merchantId: string, serviceKey: string, username = '', password = '', userAgent = '') {
+  return hepsiburadaAuthHeaders(merchantId, serviceKey, username || merchantId, password || serviceKey, userAgent)
+}
 
 function cachePazaramaToken(token: string): string {
   pazaramaTokenCache = {
@@ -156,8 +236,45 @@ function cleanKey(value: unknown): string {
   return String(value ?? '').trim()
 }
 
+function istanbulDayBounds(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Istanbul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  const dateKey = formatter.format(date)
+  const start = new Date(`${dateKey}T00:00:00+03:00`)
+  const end = new Date(start)
+  end.setUTCDate(end.getUTCDate() + 1)
+  return { dateKey, start, end }
+}
+
+function istanbulTimeMinutes(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/Istanbul',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date)
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find(part => part.type === type)?.value ?? ''
+  return Number(value('hour')) * 60 + Number(value('minute'))
+}
+
+function metadataNumber(value: unknown, key: string): number {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 0
+  const raw = (value as Record<string, unknown>)[key]
+  const numberValue = Number(raw)
+  return Number.isFinite(numberValue) ? numberValue : 0
+}
+
 function normalizeKey(value: unknown): string {
   return cleanKey(value).toLocaleUpperCase('tr-TR')
+}
+
+function normalizeStatusKey(value: unknown): string {
+  return normalizeKey(value).replace(/İ/g, 'I')
 }
 
 function matchesPriceRange(rule: Pick<LivePriceRule, 'priceStart' | 'priceEnd'>, basePrice: number): boolean {
@@ -169,12 +286,12 @@ function matchesPriceRange(rule: Pick<LivePriceRule, 'priceStart' | 'priceEnd'>,
 }
 
 function resolveLiveMarketplacePrice(
-  product: Pick<Product, 'id' | 'price' | 'brand' | 'categoryRaw'>,
+  product: Pick<Product, 'id' | 'price' | 'brand' | 'categoryRaw'> & { source?: PurchaseCostSource | null },
   marketplace: Marketplace,
   rules: LivePriceRule[],
   minPrice: number
 ) {
-  const basePrice = Number(product.price)
+  const basePrice = calculatePurchaseCost(product.price, product.source)
   if (!Number.isFinite(basePrice) || basePrice <= 0) return null
 
   const scopedRules = rules.filter(rule => matchesPriceRange(rule, basePrice))
@@ -238,6 +355,7 @@ function extractToken(data: unknown): string | null {
   return (
     payload?.access_token ||
     payload?.accessToken ||
+    payload?.token ||
     payload?.data?.access_token ||
     payload?.data?.accessToken ||
     payload?.data?.token ||
@@ -247,8 +365,9 @@ function extractToken(data: unknown): string | null {
 
 function pazaramaMessage(error: unknown): string {
   if (axios.isAxiosError(error)) {
-    const data = error.response?.data as Record<string, unknown> | undefined
-    return cleanKey(data?.userMessage || data?.message || error.message)
+    const data = error.response?.data as Record<string, unknown> | string | undefined
+    if (typeof data === 'string') return cleanKey(data || error.message)
+    return cleanKey(data?.userMessage || data?.message || data?.error || (data ? JSON.stringify(data) : error.message))
   }
 
   if (error instanceof Error) return error.message
@@ -260,16 +379,24 @@ function normalizeMarketplaceProducts(data: unknown): MarketplaceProduct[] {
   const candidates = [
     root,
     root?.data,
+    root?.data?.data,
     root?.content,
     root?.data?.items,
     root?.data?.products,
     root?.data?.result,
     root?.data?.list,
     root?.data?.content,
+    root?.data?.listings,
+    root?.data?.data?.items,
+    root?.data?.data?.products,
+    root?.data?.data?.result,
+    root?.data?.data?.list,
+    root?.data?.data?.content,
     root?.items,
     root?.products,
     root?.result,
     root?.list,
+    root?.listings,
   ]
 
   for (const value of candidates) {
@@ -315,10 +442,19 @@ function firstImageValue(item: MarketplaceProduct): string {
   return ''
 }
 
-function marketplaceListingKey(item: MarketplaceProduct): string {
+function marketplaceListingKey(item: MarketplaceProduct, marketplace?: Marketplace): string {
+  if (marketplace === 'HEPSIBURADA') {
+    const listingId = firstCleanValue(item, ['listingId'])
+    if (listingId) return listingId
+  }
   return firstCleanValue(item, [
+    'merchantSku',
+    'MerchantSku',
+    'hbSku',
+    'HB_SKU',
     'stockCode',
     'barcode',
+    'Barcode',
     'gtin',
     'productSellerCode',
     'productCode',
@@ -329,12 +465,77 @@ function marketplaceListingKey(item: MarketplaceProduct): string {
   ])
 }
 
-function marketplaceExternalStatus(item: MarketplaceProduct, stock: number | null = null): ListingStatus {
-  const statusText = normalizeKey(item.status || item.productStatus || item.state)
-  const saleStatusText = normalizeKey(item.saleStatus)
+export function marketplaceExternalStatus(item: MarketplaceProduct, marketplace: Marketplace, stock: number | null = null): ListingStatus {
+  const statusText = normalizeStatusKey(item.status || item.productStatus || item.state || item.__hbStatus || item.importStatus)
+  const saleStatusText = normalizeStatusKey(item.saleStatus)
+  const compactSaleStatusText = saleStatusText.replace(/[^A-Z0-9]/g, '')
   const approved = item.approved ?? item.isApproved
   const onSale = item.onSale ?? item.saleable ?? item.isOnSale
   const archived = item.archived ?? item.isArchived
+  const productStatusNumber = Number(item.productStatus)
+  const stateNumber = Number(item.state)
+
+  if (marketplace === 'PAZARAMA') {
+    if (productStatusNumber === 1) {
+      return stock !== null && stock <= 0 ? 'DELISTED' : 'PUBLISHED'
+    }
+    if (productStatusNumber === 10) {
+      return 'DELISTED'
+    }
+    if (productStatusNumber === 3 || productStatusNumber === 4) {
+      return 'FAILED'
+    }
+  }
+  if (marketplace === 'N11') {
+    if (statusText.includes('REJECT')) {
+      return 'FAILED'
+    }
+    if (statusText.includes('APPROVAL') || statusText.includes('WAIT') || statusText.includes('PENDING')) {
+      return 'PENDING'
+    }
+    if (compactSaleStatusText.includes('OUTOFSTOCK')) {
+      return 'DELISTED'
+    }
+  }
+  if (marketplace === 'HEPSIBURADA') {
+    if (item.isSalable === true) {
+      return stock !== null && stock <= 0 ? 'DELISTED' : 'PUBLISHED'
+    }
+    if (
+      item.isSalable === false ||
+      item.isSuspended === true ||
+      item.isLocked === true ||
+      item.isFrozen === true
+    ) {
+      return 'DELISTED'
+    }
+    if (statusText === 'MATCHED') {
+      return stock !== null && stock <= 0 ? 'DELISTED' : 'PUBLISHED'
+    }
+    if (
+      statusText.includes('REJECT') ||
+      statusText.includes('FAILED') ||
+      statusText.includes('ERROR') ||
+      statusText.includes('MISSING') ||
+      statusText.includes('EKSIK')
+    ) {
+      return 'FAILED'
+    }
+    if (
+      statusText.includes('WAIT') ||
+      statusText.includes('PENDING') ||
+      statusText.includes('APPROVAL') ||
+      statusText.includes('PREMATCH') ||
+      statusText.includes('STAGED') ||
+      statusText.includes('KATALOG') ||
+      statusText.includes('INCE')
+    ) {
+      return 'PENDING'
+    }
+    if (statusText.includes('READY') || statusText.includes('SALE') || statusText.includes('ACTIVE') || statusText.includes('APPROVED')) {
+      return stock !== null && stock <= 0 ? 'DELISTED' : 'PUBLISHED'
+    }
+  }
 
   if (statusText.includes('REJECT') || statusText.includes('FAIL') || statusText.includes('ERROR')) {
     return 'FAILED'
@@ -351,7 +552,7 @@ function marketplaceExternalStatus(item: MarketplaceProduct, stock: number | nul
   if (statusText.includes('ACTIVE') && saleStatusText.includes('ON_SALE')) {
     return 'PUBLISHED'
   }
-  if (statusText.includes('ACTIVE') && saleStatusText.includes('OUT_OF_STOCK')) {
+  if (statusText.includes('ACTIVE') && compactSaleStatusText.includes('OUTOFSTOCK')) {
     return 'DELISTED'
   }
   if (archived === true || statusText.includes('ARCHIVED') || statusText.includes('PASSIVE') || statusText.includes('DELIST')) {
@@ -375,11 +576,42 @@ function marketplaceExternalStatus(item: MarketplaceProduct, stock: number | nul
   return 'PUBLISHED'
 }
 
+export function isMarketplaceProductOnSale(item: MarketplaceProduct, marketplace: Marketplace): boolean {
+  const stock = firstNumberValue(item, [
+    'stockCount',
+    'quantity',
+    'stock',
+    'availableStock',
+    'saleStock',
+    'availableStockCount',
+  ])
+  const normalizedStock = stock === null ? null : Math.trunc(stock)
+  const statusText = normalizeStatusKey(item.status || item.productStatus || item.state || item.__hbStatus || item.importStatus)
+  const saleStatus = normalizeStatusKey(item.saleStatus).replace(/[^A-Z0-9]/g, '')
+
+  if (normalizedStock !== null && normalizedStock <= 0) return false
+
+  if (marketplace === 'TRENDYOL') {
+    return item.approved === true && item.archived !== true && item.onSale === true
+  }
+  if (marketplace === 'N11') {
+    return statusText === 'ACTIVE' && saleStatus === 'ONSALE'
+  }
+  if (marketplace === 'PAZARAMA') {
+    return Number(item.productStatus) === 1
+  }
+  if (marketplace === 'HEPSIBURADA') {
+    return item.isSalable === true
+  }
+
+  return marketplaceExternalStatus(item, marketplace, normalizedStock) === 'PUBLISHED'
+}
+
 function marketplaceExternalData(item: MarketplaceProduct, marketplace: Marketplace, now: Date) {
-  const listingKey = marketplaceListingKey(item)
+  const listingKey = marketplaceListingKey(item, marketplace)
   if (!listingKey) return null
 
-  const stock = firstNumberValue(item, ['stockCount', 'quantity', 'stock', 'availableStock', 'saleStock'])
+  const stock = firstNumberValue(item, ['stockCount', 'quantity', 'stock', 'availableStock', 'saleStock', 'availableStockCount'])
   const normalizedStock = stock === null ? null : Math.trunc(stock)
   const price = firstNumberValue(item, ['salePrice', 'price', 'listPrice', 'marketPrice', 'sellingPrice'])
   const raw = JSON.parse(JSON.stringify(item)) as Prisma.InputJsonValue
@@ -388,15 +620,15 @@ function marketplaceExternalData(item: MarketplaceProduct, marketplace: Marketpl
     where: { marketplace_listingKey: { marketplace, listingKey } },
     update: {
       externalListingId: externalListingId(item) || listingKey,
-      stockCode: firstCleanValue(item, ['stockCode', 'productSellerCode', 'productCode', 'code']) || null,
-      barcode: firstCleanValue(item, ['barcode', 'gtin']) || null,
+      stockCode: firstCleanValue(item, ['stockCode', 'merchantSku', 'MerchantSku', 'productSellerCode', 'productCode', 'code']) || null,
+      barcode: firstCleanValue(item, ['barcode', 'Barcode', 'gtin']) || null,
       title: marketplaceItemName(item) || listingKey,
-      brand: firstCleanValue(item, ['brandName', 'brand']) || null,
-      categoryName: firstCleanValue(item, ['categoryName', 'category', 'categoryPath']) || null,
+      brand: firstCleanValue(item, ['brandName', 'brand', 'Marka']) || null,
+      categoryName: firstCleanValue(item, ['categoryName', 'category', 'categoryPath', 'categoryId']) || null,
       imageUrl: firstImageValue(item) || null,
       price,
       stock: normalizedStock,
-      status: marketplaceExternalStatus(item, normalizedStock),
+      status: marketplaceExternalStatus(item, marketplace, normalizedStock),
       raw,
       lastSeenAt: now,
     },
@@ -404,15 +636,15 @@ function marketplaceExternalData(item: MarketplaceProduct, marketplace: Marketpl
       marketplace,
       listingKey,
       externalListingId: externalListingId(item) || listingKey,
-      stockCode: firstCleanValue(item, ['stockCode', 'productSellerCode', 'productCode', 'code']) || null,
-      barcode: firstCleanValue(item, ['barcode', 'gtin']) || null,
+      stockCode: firstCleanValue(item, ['stockCode', 'merchantSku', 'MerchantSku', 'productSellerCode', 'productCode', 'code']) || null,
+      barcode: firstCleanValue(item, ['barcode', 'Barcode', 'gtin']) || null,
       title: marketplaceItemName(item) || listingKey,
-      brand: firstCleanValue(item, ['brandName', 'brand']) || null,
-      categoryName: firstCleanValue(item, ['categoryName', 'category', 'categoryPath']) || null,
+      brand: firstCleanValue(item, ['brandName', 'brand', 'Marka']) || null,
+      categoryName: firstCleanValue(item, ['categoryName', 'category', 'categoryPath', 'categoryId']) || null,
       imageUrl: firstImageValue(item) || null,
       price,
       stock: normalizedStock,
-      status: marketplaceExternalStatus(item, normalizedStock),
+      status: marketplaceExternalStatus(item, marketplace, normalizedStock),
       raw,
       firstSeenAt: now,
       lastSeenAt: now,
@@ -430,8 +662,7 @@ async function getPazaramaAccessToken(providedToken?: string): Promise<string> {
     return pazaramaTokenCache.token
   }
 
-  const clientId = process.env.PZ_CLIENT_ID
-  const clientSecret = process.env.PZ_CLIENT_SECRET
+  const { clientId, clientSecret } = await pazaramaApiCredentials()
 
   if (!clientId || !clientSecret) {
     throw new Error('Pazarama API bilgileri eksik')
@@ -468,11 +699,15 @@ async function getPazaramaAccessToken(providedToken?: string): Promise<string> {
 
 function marketplaceItemKeys(item: MarketplaceProduct): string[] {
   return [
+    item.merchantSku,
+    item.MerchantSku,
+    item.hbSku,
     item.stockCode,
     item.code,
     item.productCode,
     item.productSellerCode,
     item.barcode,
+    item.Barcode,
     item.gtin,
     item.productMainId,
   ].flatMap(marketplaceKeyVariants)
@@ -480,18 +715,22 @@ function marketplaceItemKeys(item: MarketplaceProduct): string[] {
 
 function marketplaceItemRawKeys(item: MarketplaceProduct): string[] {
   return [
+    item.merchantSku,
+    item.MerchantSku,
+    item.hbSku,
     item.stockCode,
     item.code,
     item.productCode,
     item.productSellerCode,
     item.barcode,
+    item.Barcode,
     item.gtin,
     item.productMainId,
   ].flatMap(marketplaceKeyVariants)
 }
 
 function marketplaceItemName(item: MarketplaceProduct): string {
-  return cleanKey(item.displayName || item.name || item.title || item.productName)
+  return cleanKey(item.displayName || item.name || item.title || item.productName || item.UrunAdi)
 }
 
 function matchProduct(item: MarketplaceProduct, products: Product[]): Product | null {
@@ -555,6 +794,9 @@ async function findProductByTitle(item: MarketplaceProduct): Promise<Product | n
 
 function externalListingId(item: MarketplaceProduct): string {
   return cleanKey(
+    item.hbSku ||
+    item.merchantSku ||
+    item.MerchantSku ||
     item.id ||
     item.productId ||
     item.code ||
@@ -569,9 +811,9 @@ function externalListingId(item: MarketplaceProduct): string {
 
 function unmatchedProductSummary(item: MarketplaceProduct): UnmatchedMarketplaceProduct {
   return {
-    code: cleanKey(item.code || item.productCode || item.productSellerCode),
-    stockCode: cleanKey(item.stockCode),
-    barcode: cleanKey(item.barcode || item.gtin),
+    code: cleanKey(item.code || item.productCode || item.productSellerCode || item.hbSku),
+    stockCode: cleanKey(item.stockCode || item.merchantSku || item.MerchantSku),
+    barcode: cleanKey(item.barcode || item.Barcode || item.gtin),
     name: marketplaceItemName(item),
   }
 }
@@ -614,9 +856,7 @@ function pazaramaPriceStockPayloadItem(item: StockUpdateItem, mode: MarketplaceU
 }
 
 async function sendTrendyolUpdates(items: StockUpdateItem[], mode: MarketplaceUpdateMode) {
-  const apiKey = process.env.TY_API_KEY
-  const apiSecret = process.env.TY_API_SECRET
-  const supplierId = process.env.TY_SUPPLIER_ID
+  const { apiKey, apiSecret, supplierId } = await trendyolApiCredentials()
   if (!apiKey || !apiSecret || !supplierId) throw new Error('Trendyol API bilgileri eksik')
 
   for (const chunk of chunkArray(items, 1000)) {
@@ -635,9 +875,7 @@ async function sendTrendyolUpdates(items: StockUpdateItem[], mode: MarketplaceUp
 }
 
 async function sendTrendyolArchive(barcodes: string[]) {
-  const apiKey = process.env.TY_API_KEY
-  const apiSecret = process.env.TY_API_SECRET
-  const supplierId = process.env.TY_SUPPLIER_ID
+  const { apiKey, apiSecret, supplierId } = await trendyolApiCredentials()
   if (!apiKey || !apiSecret || !supplierId) throw new Error('Trendyol API bilgileri eksik')
 
   const results: Array<{ count: number; batchRequestId: string | null }> = []
@@ -665,24 +903,36 @@ async function sendTrendyolArchive(barcodes: string[]) {
 }
 
 async function sendN11Updates(items: StockUpdateItem[], mode: MarketplaceUpdateMode) {
-  const appKey = process.env.N11_APPKEY
-  const appSecret = process.env.N11_APPSECRET
+  const { appKey, appSecret } = await n11ApiCredentials()
   if (!appKey || !appSecret) throw new Error('N11 API bilgileri eksik')
 
   for (const chunk of chunkArray(items, 1000)) {
-    await axios.post(
-      N11_STOCK_URL,
-      {
-        payload: {
-          integrator: 'PazarioIntegration',
-          skus: chunk.map(item => n11PayloadItem(item, mode)),
+    try {
+      await axios.post(
+        N11_STOCK_URL,
+        {
+          payload: {
+            integrator: 'PazarioIntegration',
+            skus: chunk.map(item => n11PayloadItem(item, mode)),
+          },
         },
-      },
-      {
-        headers: { appkey: appKey, appsecret: appSecret },
-        timeout: 60000,
+        {
+          headers: { appkey: appKey, appsecret: appSecret },
+          timeout: 60000,
+        }
+      )
+    } catch (error) {
+      const responseData = axios.isAxiosError(error)
+        ? error.response?.data as { errorCode?: string; errorMessage?: string } | undefined
+        : undefined
+      if (responseData?.errorCode === 'TASK_ERR_010') {
+        throw new MarketplaceSyncDeferredError(
+          responseData.errorMessage || 'N11 onceki stok/fiyat paketini isliyor.',
+          15 * 60 * 1000,
+        )
       }
-    )
+      throw error
+    }
   }
 }
 
@@ -710,18 +960,84 @@ async function sendPazaramaUpdates(items: StockUpdateItem[], mode: MarketplaceUp
   }
 }
 
+async function sendHepsiburadaUpdates(items: StockUpdateItem[], mode: MarketplaceUpdateMode) {
+  const { merchantId, serviceKey, username, password, userAgent } = await hepsiburadaApiCredentials()
+  if (!merchantId || !password || !userAgent) throw new Error('Hepsiburada API bilgileri eksik')
+
+  const invalidItem = items.find(item => !item.externalListingId || !item.sku)
+  if (invalidItem) {
+    throw new Error(`Hepsiburada listeleme kimligi eksik: ${invalidItem.sku || invalidItem.productId}`)
+  }
+
+  const adapter = new HepsiburadaAdapter(
+    merchantId,
+    serviceKey,
+    username || merchantId,
+    password,
+    userAgent,
+  )
+  const normalizeSku = (value: unknown) => cleanKey(value).toLocaleUpperCase('tr-TR').replace(/\s+/g, '')
+  const requestedSkus = new Set(items.map(item => normalizeSku(item.sku)))
+  const hepsiburadaSkuByMerchantSku = new Map<string, string>()
+
+  for (let offset = 0; offset < 100_000 && hepsiburadaSkuByMerchantSku.size < requestedSkus.size; offset += 100) {
+    const page = await adapter.listListings(offset, 100)
+    for (const listing of page.listings) {
+      const merchantSku = normalizeSku(listing.merchantSku)
+      const hepsiburadaSku = cleanKey(listing.hepsiburadaSku)
+      if (requestedSkus.has(merchantSku) && hepsiburadaSku) {
+        hepsiburadaSkuByMerchantSku.set(merchantSku, hepsiburadaSku)
+      }
+    }
+    if (page.listings.length === 0 || offset + page.listings.length >= page.totalCount) break
+  }
+
+  const unresolved = items.filter(item => !hepsiburadaSkuByMerchantSku.has(normalizeSku(item.sku)))
+  if (unresolved.length > 0) {
+    throw new Error(`Hepsiburada SKU eslesmesi bulunamadi: ${unresolved.slice(0, 10).map(item => item.sku).join(', ')}`)
+  }
+
+  const uploadIds = await adapter.updateListings(items.map(item => ({
+    merchantSku: item.sku,
+    hepsiburadaSku: hepsiburadaSkuByMerchantSku.get(normalizeSku(item.sku))!,
+    availableStock: item.targetStock,
+    price: item.targetPrice ?? undefined,
+  })), mode)
+
+  const uploadTypes: Array<'stock' | 'price'> = mode === 'stock-price'
+    ? uploadIds.flatMap((_, index) => index % 2 === 0 ? ['stock'] : ['price'])
+    : uploadIds.map(() => mode)
+  await new Promise(resolve => setTimeout(resolve, 3000))
+  for (let index = 0; index < uploadIds.length; index += 1) {
+    const status = await adapter.getListingUploadStatus(uploadTypes[index], uploadIds[index])
+    if (Array.isArray(status.errors) && status.errors.length > 0) {
+      throw new Error(`Hepsiburada ${uploadTypes[index]} upload hatasi: ${JSON.stringify(status.errors)}`)
+    }
+  }
+
+  await prisma.$transaction(items.map(item => prisma.marketplaceListing.update({
+    where: { productId_marketplace: { productId: item.productId, marketplace: 'HEPSIBURADA' } },
+    data: { externalListingId: hepsiburadaSkuByMerchantSku.get(normalizeSku(item.sku))! },
+  })))
+
+  return uploadIds
+}
+
 async function sendMarketplaceUpdates(marketplace: Marketplace, items: StockUpdateItem[], mode: MarketplaceUpdateMode) {
   if (marketplace === 'TRENDYOL') {
     await sendTrendyolUpdates(items, mode)
-    return
+    return []
+  }
+  if (marketplace === 'HEPSIBURADA') {
+    return sendHepsiburadaUpdates(items, mode)
   }
   if (marketplace === 'N11') {
     await sendN11Updates(items, mode)
-    return
+    return []
   }
   if (marketplace === 'PAZARAMA') {
     await sendPazaramaUpdates(items, mode)
-    return
+    return []
   }
 
   throw new Error(`${marketplace} stok/fiyat guncelleme API baglantisi henuz tanimli degil`)
@@ -790,25 +1106,16 @@ async function fetchMarketplacePage(
       timeout: 60000,
     })
     const approvedProducts = normalizeMarketplaceProducts(approvedResponse.data)
-    if (approvedProducts.length > 0 || page > 1) return approvedProducts
-
-    const response = await axios.get(PAZARAMA_PRODUCTS_URL, {
-      params: { Size: pageSize, Page: page },
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 60000,
-    })
-    return normalizeMarketplaceProducts(response.data)
+    return approvedProducts
   }
 
   if (marketplace === 'TRENDYOL') {
-    const apiKey = process.env.TY_API_KEY
-    const apiSecret = process.env.TY_API_SECRET
-    const supplierId = process.env.TY_SUPPLIER_ID
+    const { apiKey, apiSecret, supplierId } = await trendyolApiCredentials()
     if (!apiKey || !apiSecret || !supplierId) throw new Error('Trendyol API bilgileri eksik')
 
     const response = await axios.get(`${TRENDYOL_PRODUCTS_URL}/${supplierId}/products`, {
       auth: { username: apiKey, password: apiSecret },
-      params: { page: page - 1, size: pageSize },
+      params: { page: page - 1, size: pageSize, approved: true, archived: false },
       headers: { 'User-Agent': `PazarioIntegration - ${supplierId}` },
       timeout: 60000,
     })
@@ -816,8 +1123,7 @@ async function fetchMarketplacePage(
   }
 
   if (marketplace === 'N11') {
-    const appKey = process.env.N11_APPKEY
-    const appSecret = process.env.N11_APPSECRET
+    const { appKey, appSecret } = await n11ApiCredentials()
     if (!appKey || !appSecret) throw new Error('N11 API bilgileri eksik')
 
     const response = await axios.get(N11_PRODUCTS_URL, {
@@ -828,19 +1134,30 @@ async function fetchMarketplacePage(
     return normalizeMarketplaceProducts(response.data)
   }
 
+  if (marketplace === 'HEPSIBURADA') {
+    const { merchantId, serviceKey, username, password, userAgent } = await hepsiburadaApiCredentials()
+    if (!merchantId || (!serviceKey && (!username || !password))) throw new Error('Hepsiburada API bilgileri eksik')
+
+    const response = await axios.get(
+      hepsiburadaListingApiUrl(`/listings/merchantid/${encodeURIComponent(merchantId)}`),
+      {
+        params: { offset: (page - 1) * pageSize, limit: pageSize },
+        headers: hepsiburadaHeaders(merchantId, serviceKey, username, password, userAgent),
+        timeout: 60000,
+      }
+    )
+    return normalizeMarketplaceProducts(response.data)
+  }
+
   throw new Error(`${marketplace} icin pazaryeri importu desteklenmiyor`)
 }
 
-async function importMarketplaceListings(
+export async function importMarketplaceListings(
   marketplace: Marketplace,
   pageSize: number,
   maxPages: number,
   providedToken?: string
 ): Promise<ImportSummary> {
-  if (marketplace === 'HEPSIBURADA') {
-    throw new Error('Hepsiburada importu bu islemde devre disi')
-  }
-
   const now = new Date()
   let fetched = 0
   let matched = 0
@@ -862,22 +1179,27 @@ async function importMarketplaceListings(
   }))
 
   for (let page = 1; page <= maxPages; page += 1) {
-    const items = await fetchMarketplacePage(marketplace, page, pageSize, providedToken)
-    if (items.length === 0) {
+    const pageItems = await fetchMarketplacePage(marketplace, page, pageSize, providedToken)
+    if (pageItems.length === 0) {
       fullScan = true
       break
     }
 
+    const items = pageItems.filter(item => isMarketplaceProductOnSale(item, marketplace))
+
     fetched += items.length
 
     for (const item of items) {
-      const externalData = marketplaceExternalData(item, marketplace, now)
+      const product = matchProductFast(item, matcher)
+      const externalItem = marketplace === 'HEPSIBURADA' && product
+        ? { ...item, productName: product.title }
+        : item
+      const externalData = marketplaceExternalData(externalItem, marketplace, now)
       if (externalData) {
         await prisma.marketplaceExternalProduct.upsert(externalData)
         seenExternalKeys.add(externalData.create.listingKey)
       }
 
-      const product = matchProductFast(item, matcher)
       if (!product) {
         if (unmatched.length < 20) {
           unmatched.push({
@@ -892,7 +1214,8 @@ async function importMarketplaceListings(
 
       matched += 1
       matchedProductIds.add(product.id)
-      const externalStatus = marketplaceExternalStatus(item)
+      const stock = firstNumberValue(item, ['stockCount', 'quantity', 'stock', 'availableStock', 'saleStock'])
+      const externalStatus = marketplaceExternalStatus(item, marketplace, stock === null ? null : Math.trunc(stock))
       await prisma.marketplaceListing.upsert({
         where: { productId_marketplace: { productId: product.id, marketplace } },
         update: {
@@ -915,7 +1238,7 @@ async function importMarketplaceListings(
       imported += 1
     }
 
-    if (items.length < pageSize) {
+    if (pageItems.length < pageSize) {
       fullScan = true
       break
     }
@@ -937,16 +1260,26 @@ async function importMarketplaceListings(
   }
 
   if (fullScan && seenExternalKeys.size > 0) {
-    await prisma.marketplaceExternalProduct.updateMany({
-      where: {
-        marketplace,
-        listingKey: { notIn: Array.from(seenExternalKeys) },
-      },
-      data: {
-        status: 'DELISTED',
-        lastSeenAt: now,
-      },
-    })
+    if (marketplace === 'HEPSIBURADA') {
+      await prisma.marketplaceExternalProduct.updateMany({
+        where: {
+          marketplace,
+          listingKey: { notIn: Array.from(seenExternalKeys) },
+        },
+        data: { status: 'DELISTED' },
+      })
+    } else {
+      await prisma.marketplaceExternalProduct.updateMany({
+        where: {
+          marketplace,
+          listingKey: { notIn: Array.from(seenExternalKeys) },
+        },
+        data: {
+          status: 'DELISTED',
+          lastSeenAt: now,
+        },
+      })
+    }
   }
 
   return { marketplace, fetched, matched, imported, delisted, fullScan, unmatched }
@@ -957,10 +1290,6 @@ async function findUnmatchedMarketplaceListings(
   pageSize: number,
   maxPages: number
 ) {
-  if (marketplace !== 'TRENDYOL') {
-    throw new Error('Su anda sadece Trendyol eslesmeyen urun kontrolu destekleniyor')
-  }
-
   let fetched = 0
   let matched = 0
   const unmatched: UnmatchedMarketplaceProduct[] = []
@@ -992,8 +1321,9 @@ async function findUnmatchedMarketplaceListings(
   }
 
   for (let page = 1; page <= maxPages; page += 1) {
-    const items = await fetchMarketplacePage(marketplace, page, pageSize)
-    if (items.length === 0) break
+    const pageItems = await fetchMarketplacePage(marketplace, page, pageSize)
+    if (pageItems.length === 0) break
+    const items = pageItems.filter(item => isMarketplaceProductOnSale(item, marketplace))
 
     fetched += items.length
 
@@ -1007,7 +1337,7 @@ async function findUnmatchedMarketplaceListings(
       unmatched.push(unmatchedProductSummary(item))
     }
 
-    if (items.length < pageSize) break
+    if (pageItems.length < pageSize) break
   }
 
   return { marketplace, fetched, matched, unmatchedCount: unmatched.length, unmatched }
@@ -1019,6 +1349,13 @@ export async function getMarketplaceListings(req: Request, res: Response) {
     const limit = parseInt(String(req.query.limit || '50'))
     const skip = (page - 1) * limit
     const where = buildExternalListingWhere(req)
+    if (marketplaceFromQuery(req) === 'HEPSIBURADA') {
+      const latest = await prisma.marketplaceExternalProduct.aggregate({
+        where: { marketplace: 'HEPSIBURADA' },
+        _max: { lastSeenAt: true },
+      })
+      if (latest._max.lastSeenAt) where.lastSeenAt = latest._max.lastSeenAt
+    }
 
     const [data, total] = await Promise.all([
       prisma.marketplaceExternalProduct.findMany({
@@ -1039,18 +1376,145 @@ export async function getMarketplaceListings(req: Request, res: Response) {
 export async function getMarketplaceStats(req: Request, res: Response) {
   try {
     const marketplace = marketplaceFromQuery(req)
+    const latest = marketplace === 'HEPSIBURADA'
+      ? await prisma.marketplaceExternalProduct.aggregate({
+          where: { marketplace },
+          _max: { lastSeenAt: true },
+        })
+      : null
+    const snapshotWhere = latest?._max.lastSeenAt ? { lastSeenAt: latest._max.lastSeenAt } : {}
 
     const [pending, published, failed, delisted, total] = await Promise.all([
-      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'PENDING' } }),
-      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'PUBLISHED' } }),
-      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'FAILED' } }),
-      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'DELISTED' } }),
-      prisma.marketplaceExternalProduct.count({ where: { marketplace } }),
+      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'PENDING', ...snapshotWhere } }),
+      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'PUBLISHED', ...snapshotWhere } }),
+      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'FAILED', ...snapshotWhere } }),
+      prisma.marketplaceExternalProduct.count({ where: { marketplace, status: 'DELISTED', ...snapshotWhere } }),
+      prisma.marketplaceExternalProduct.count({ where: { marketplace, ...snapshotWhere } }),
     ])
 
     res.json({ success: true, data: { pending, published, failed, delisted, total } })
   } catch (e) {
     res.status(500).json({ success: false, error: 'Pazaryeri istatistikleri alinamadi' })
+  }
+}
+
+export async function getMarketplaceDailyReport(_req: Request, res: Response) {
+  try {
+    const { dateKey, start, end } = istanbulDayBounds()
+    const [operations, settings] = await Promise.all([
+      prisma.operationHistory.findMany({
+        where: {
+          type: { in: ['STOCK_UPDATE', 'PRICE_UPDATE', 'STOCK_PRICE_UPDATE'] },
+          createdAt: {
+            gte: start,
+            lt: end,
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          type: true,
+          status: true,
+          marketplace: true,
+          targetCount: true,
+          successCount: true,
+          failedCount: true,
+          skippedCount: true,
+          metadata: true,
+          createdAt: true,
+          finishedAt: true,
+          updatedAt: true,
+          errorMessage: true,
+        },
+      }),
+      prisma.marketplaceSyncSetting.findMany({
+        select: {
+          marketplace: true,
+          enabled: true,
+          mode: true,
+          scheduleTime: true,
+          limit: true,
+          batchStartedAt: true,
+          batchNextRunAt: true,
+          lastRunAt: true,
+        },
+      }),
+    ])
+
+    const settingByMarketplace = new Map(settings.map(setting => [setting.marketplace, setting]))
+    const byMarketplace = new Map<Marketplace, MarketplaceDailyReportRow>()
+    for (const marketplace of MARKETPLACES) {
+      const setting = settingByMarketplace.get(marketplace)
+      byMarketplace.set(marketplace, {
+        marketplace,
+        enabled: setting?.enabled ?? false,
+        scheduleTime: setting?.scheduleTime ?? null,
+        scanned: 0,
+        prepared: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        operations: 0,
+        lastOperationAt: null,
+        nextBatchAt: setting?.batchStartedAt ? setting.batchNextRunAt : null,
+        inProgress: Boolean(setting?.batchStartedAt),
+      })
+    }
+
+    for (const operation of operations) {
+      if (!operation.marketplace) continue
+      const item = byMarketplace.get(operation.marketplace)
+      if (!item) continue
+      item.operations += 1
+      item.scanned += metadataNumber(operation.metadata, 'scanned') || operation.targetCount
+      item.prepared += metadataNumber(operation.metadata, 'prepared') || operation.successCount + operation.failedCount
+      item.updated += metadataNumber(operation.metadata, 'updated') || operation.successCount
+      item.skipped += operation.skippedCount
+      item.failed += operation.failedCount
+      const operationAt = operation.finishedAt ?? operation.updatedAt ?? operation.createdAt
+      if (operationAt && (!item.lastOperationAt || operationAt > item.lastOperationAt)) {
+        item.lastOperationAt = operationAt
+      }
+    }
+
+    const data = Array.from(byMarketplace.values())
+    const totals = data.reduce(
+      (acc, item) => ({
+        scanned: acc.scanned + item.scanned,
+        prepared: acc.prepared + item.prepared,
+        updated: acc.updated + item.updated,
+        skipped: acc.skipped + item.skipped,
+        failed: acc.failed + item.failed,
+        operations: acc.operations + item.operations,
+      }),
+      { scanned: 0, prepared: 0, updated: 0, skipped: 0, failed: 0, operations: 0 }
+    )
+
+    const recentFailures = operations
+      .filter(operation => operation.status === 'FAILED' || operation.status === 'PARTIALLY_FAILED')
+      .slice(0, 5)
+      .map(operation => ({
+        id: operation.id,
+        marketplace: operation.marketplace,
+        type: operation.type,
+        status: operation.status,
+        message: operation.errorMessage,
+        at: operation.finishedAt ?? operation.updatedAt ?? operation.createdAt,
+      }))
+
+    res.json({
+      success: true,
+      data: {
+        date: dateKey,
+        startAt: start,
+        endAt: end,
+        totals,
+        marketplaces: data,
+        recentFailures,
+      },
+    })
+  } catch (e) {
+    res.status(500).json({ success: false, error: 'Gunluk urun guncelleme operasyon raporu alinamadi' })
   }
 }
 
@@ -1066,15 +1530,16 @@ export async function importMarketplaceListingsController(req: Request, res: Res
       res.status(400).json({ success: false, error: 'Gecersiz pazaryeri' })
       return
     }
-    if (requestedMarketplace === 'HEPSIBURADA') {
-      res.status(400).json({ success: false, error: 'Hepsiburada importu devre disi' })
-      return
-    }
 
     const pageSize = Math.min(Math.max(parseInt(String(req.body?.size || '100')), 1), 100)
     const maxPages = Math.min(Math.max(parseInt(String(req.body?.maxPages || '200')), 1), 1000)
-    const bearerToken = extractBearerToken(req.headers.authorization || req.body?.token || req.body?.accessToken)
-    const result = await importMarketplaceListings(requestedMarketplace, pageSize, maxPages, bearerToken)
+    const marketplaceToken = extractBearerToken(
+      req.body?.marketplaceToken ||
+      req.body?.token ||
+      req.body?.accessToken ||
+      req.headers['x-marketplace-token']
+    )
+    const result = await importMarketplaceListings(requestedMarketplace, pageSize, maxPages, marketplaceToken)
 
     res.status(201).json({
       success: true,
@@ -1159,12 +1624,9 @@ export async function runMarketplaceSync(
   marketplace: Marketplace,
   mode: MarketplaceUpdateMode,
   dryRun: boolean,
-  limit: number
+  limit: number,
+  options: { updatedBefore?: Date; sourceId?: string } = {}
 ) {
-  if (marketplace === 'HEPSIBURADA') {
-    throw new Error(`${marketplace} stok/fiyat guncelleme endpointi henuz dogrulanmadi`)
-  }
-
   const safeLimit = Math.min(Math.max(limit, 1), 1000)
   const activeRules = await prisma.priceRule.findMany({
     where: {
@@ -1176,10 +1638,27 @@ export async function runMarketplaceSync(
   const globalSetting = await prisma.globalPriceSetting.findFirst()
   const minPrice = globalSetting ? Number(globalSetting.minPrice) : 50
 
+  const where: Prisma.MarketplaceListingWhereInput = {
+    marketplace,
+    status: 'PUBLISHED',
+    ...(options.sourceId ? { product: { sourceId: options.sourceId } } : {}),
+    ...(options.updatedBefore
+      ? {
+          OR: [
+            { lastUpdatedAt: null },
+            { lastUpdatedAt: { lt: options.updatedBefore } },
+          ],
+        }
+      : {}),
+  }
+
   const listings = await prisma.marketplaceListing.findMany({
-    where: { marketplace, status: 'PUBLISHED' },
+    where,
     take: safeLimit,
-    orderBy: { lastUpdatedAt: 'desc' },
+    orderBy: [
+      { lastUpdatedAt: 'asc' },
+      { publishedAt: 'asc' },
+    ],
     include: {
       product: {
         select: {
@@ -1190,6 +1669,13 @@ export async function runMarketplaceSync(
           price: true,
           brand: true,
           categoryRaw: true,
+          source: {
+            select: {
+              priceIncludesVat: true,
+              purchaseVatRate: true,
+              purchaseExtraFee: true,
+            },
+          },
           priceCalculations: {
             where: { marketplace },
             orderBy: { calculatedAt: 'desc' },
@@ -1232,8 +1718,9 @@ export async function runMarketplaceSync(
       ? items.filter(item => item.hasCalculatedPrice)
       : items
 
+  let externalBatchIds: string[] = []
   if (!dryRun && updateItems.length > 0) {
-    await sendMarketplaceUpdates(marketplace, updateItems, mode)
+    externalBatchIds = await sendMarketplaceUpdates(marketplace, updateItems, mode)
     await updateExternalProductsAfterMarketplaceSync(marketplace, updateItems, mode)
     await prisma.marketplaceListing.updateMany({
       where: { productId: { in: updateItems.map(item => item.productId) }, marketplace },
@@ -1250,20 +1737,57 @@ export async function runMarketplaceSync(
     skippedNoPrice: items.filter(item => !item.hasCalculatedPrice).length,
     zeroStock: updateItems.filter(item => item.targetStock === 0).length,
     updated: dryRun ? 0 : updateItems.length,
+    externalBatchIds,
     sample: items.slice(0, 20),
   }
 }
 
 async function syncMarketplaceValues(req: Request, res: Response, mode: MarketplaceUpdateMode) {
+  let operationId: string | null = null
   try {
     const marketplace = marketplaceFromQuery(req)
     const dryRun = req.body?.dryRun !== false
     const limit = Math.min(Math.max(parseInt(String(req.body?.limit || '100')), 1), 1000)
-    const result = await runMarketplaceSync(marketplace, mode, dryRun, limit)
+    const sourceId = cleanKey(req.body?.sourceId) || undefined
+    const operation = await operationService.createOperation({
+      type: mode === 'stock'
+        ? 'STOCK_UPDATE'
+        : mode === 'price'
+          ? 'PRICE_UPDATE'
+          : 'STOCK_PRICE_UPDATE',
+      title: `${marketplace} ${mode} guncelleme`,
+      marketplace,
+      requestedBy: 'admin',
+      targetCount: limit,
+      metadata: { dryRun, limit, sourceId },
+    })
+    operationId = operation.id
+    await operationService.markRunning(operationId)
+    const result = await runMarketplaceSync(marketplace, mode, dryRun, limit, { sourceId })
+    await operationService.markFinished(operationId, 'SUCCEEDED', {
+      successCount: result.updated,
+      skippedCount: result.skippedNoPrice + result.zeroStock,
+      metadata: result,
+    })
 
     res.json({ success: true, data: result })
   } catch (error) {
     const status = axios.isAxiosError(error) ? (error as AxiosError).response?.status : undefined
+    logger.error(
+      {
+        err: error,
+        marketplace: req.body?.marketplace || req.query.marketplace,
+        mode,
+        status,
+      },
+      'Pazaryeri stok/fiyat guncelleme hatasi'
+    )
+    if (operationId) {
+      await operationService.markFinished(operationId, 'FAILED', {
+        errorMessage: typeof pazaramaMessage(error) === 'string' ? pazaramaMessage(error) : JSON.stringify(pazaramaMessage(error)),
+        failedCount: 1,
+      }).catch(() => undefined)
+    }
     res.status(502).json({
       success: false,
       error: 'Pazaryeri stok/fiyat guncelleme hatasi',
@@ -1323,9 +1847,12 @@ export async function updateMarketplaceSyncSetting(req: Request, res: Response) 
     }
     const now = new Date()
     const [hour, minute] = scheduleTime.split(':').map(Number)
-    const scheduledToday = new Date(now)
-    scheduledToday.setHours(hour, minute, 0, 0)
-    const preventImmediateRun = Boolean(req.body?.enabled) && scheduledToday <= now
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      res.status(400).json({ success: false, error: 'Saat 00:00 ile 23:59 arasinda olmali' })
+      return
+    }
+    const preventImmediateRun = Boolean(req.body?.enabled) &&
+      (hour * 60 + minute) <= istanbulTimeMinutes(now)
 
     const setting = await prisma.marketplaceSyncSetting.upsert({
       where: { marketplace },

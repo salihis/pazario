@@ -3,6 +3,7 @@
 import { Request, Response } from 'express'
 import { PrismaClient } from '@prisma/client'
 import { PriceEngine, roundUpToNinetyNine } from '../../services/PriceEngine'
+import { calculatePurchaseCost } from '../../services/PurchaseCostService'
 import { logger } from '../../utils/logger'
 import { z } from 'zod'
 
@@ -155,6 +156,15 @@ export async function previewProductPrice(req: Request, res: Response) {
   try {
     const product = await prisma.product.findUnique({
       where: { id: req.params.productId },
+      include: {
+        source: {
+          select: {
+            priceIncludesVat: true,
+            purchaseVatRate: true,
+            purchaseExtraFee: true,
+          },
+        },
+      },
     })
     if (!product) {
       res.status(404).json({ success: false, error: 'ÃœrÃ¼n bulunamadÄ±' })
@@ -172,10 +182,11 @@ export async function previewProductPrice(req: Request, res: Response) {
     const marketplaces = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA'] as const
     const results: PricePreviewResult[] = []
 
+    const basePrice = calculatePurchaseCost(product.price, product.source)
     for (const mp of marketplaces) {
       try {
         const calc = await priceEngine.calculate({
-          basePrice: Number(product.price),
+          basePrice,
           marketplace: mp,
           productId: product.id,
           syncJobId: '00000000-0000-0000-0000-000000000000',
@@ -203,7 +214,7 @@ export async function previewProductPrice(req: Request, res: Response) {
       success: true,
       data: {
         productId: product.id,
-        basePrice: Number(product.price),
+        basePrice,
         results,
       },
     })

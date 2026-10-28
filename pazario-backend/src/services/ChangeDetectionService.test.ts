@@ -55,6 +55,20 @@ describe('ChangeDetectionService', () => {
   })
 
   describe('detect()', () => {
+    it('detects an image-only XML update', async () => {
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'db1', externalId: 'prod1', contentHash: 'hash1', stock: 10, images: ['https://example.com/old.jpg'] },
+      ])
+      const result = await service.detect('source1', [makeProduct()])
+      expect(result.changedProducts).toHaveLength(1)
+    })
+    it('never includes manual media in an XML update', async () => {
+      await service.applyChanges('source1', { newProducts: [], changedProducts: [{ product: makeProduct(), existingId: 'db1' }], unchangedIds: [], deletedExternalIds: [] }, 'job')
+      const update = (mockPrisma.product.update as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(update.data.images).toEqual(['https://example.com/image.jpg'])
+      expect(update.data).not.toHaveProperty('manualMedia')
+      expect(update.data).not.toHaveProperty('mediaVersion')
+    })
     it('should detect new products', async () => {
       const incoming = [makeProduct({ id: 'new123', contentHash: 'hash123' })]
       ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([])
@@ -91,6 +105,18 @@ describe('ChangeDetectionService', () => {
       expect(result.unchangedIds[0]).toBe('prod123')
       expect(result.newProducts).toHaveLength(0)
       expect(result.changedProducts).toHaveLength(0)
+    })
+
+    it('should detect changed products when stored stock drifted from the XML stock', async () => {
+      const incoming = [makeProduct({ id: 'existing123', contentHash: 'samehash', stock: 12 })]
+      ;(mockPrisma.product.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { id: 'prod123', externalId: 'existing123', contentHash: 'samehash', stock: 0 },
+      ])
+
+      const result = await service.detect('source1', incoming)
+
+      expect(result.changedProducts).toHaveLength(1)
+      expect(result.changedProducts[0].existingId).toBe('prod123')
     })
 
     it('should detect deleted products (in DB but not in XML)', async () => {

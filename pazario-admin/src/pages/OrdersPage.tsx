@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Printer } from 'lucide-react'
 import { api } from '../api/client'
+import { printCargoLabel } from '../services/cargoLabel'
 
 interface OrderItem {
   id: string
@@ -24,8 +26,10 @@ interface Order {
   currency: string
   trackingNumber: string | null
   cargoCompany: string | null
+  orderedAt: string | null
   createdAt: string
   items: OrderItem[]
+  invoice: { id: string; status: string; approvedFileName: string | null } | null
 }
 
 interface OrdersResponse {
@@ -93,6 +97,7 @@ export default function OrdersPage() {
   const [fetchMessage, setFetchMessage] = useState('')
   const [emailTo, setEmailTo] = useState('')
   const [emailMessage, setEmailMessage] = useState('')
+  const [labelMessage, setLabelMessage] = useState('')
   const limit = 25
 
   const { data, isLoading } = useQuery<OrdersResponse>({
@@ -109,8 +114,10 @@ export default function OrdersPage() {
   })
 
   const { data: statsData } = useQuery<{ data: { byStatus: Record<string, number> } }>({
-    queryKey: ['order-stats'],
-    queryFn: () => api.get('/orders/stats').then(r => r.data),
+    queryKey: ['order-stats', marketplace],
+    queryFn: () => api.get('/orders/stats', {
+      params: { marketplace: marketplace || undefined },
+    }).then(r => r.data),
     refetchInterval: 30000,
   })
 
@@ -164,6 +171,31 @@ export default function OrdersPage() {
     onError: (error: any) => setEmailMessage(error?.response?.data?.error || 'E-posta gonderilemedi'),
   })
 
+  const invoiceUploadMutation = useMutation({
+    mutationFn: ({ orderId, file }: { orderId: string; file: File }) =>
+      api.put(`/orders/${orderId}/invoice/approved-file`, file, {
+        params: { fileName: file.name },
+        headers: { 'Content-Type': 'application/pdf' },
+      }),
+    onSuccess: () => {
+      setFetchMessage('Onaylı fatura yüklendi. Faturalar sayfasından pazaryerine gönderebilirsiniz.')
+      queryClient.invalidateQueries({ queryKey: ['orders'] })
+      queryClient.invalidateQueries({ queryKey: ['invoices'] })
+    },
+    onError: (error: any) => setFetchMessage(error?.response?.data?.error || 'Fatura yüklenemedi'),
+  })
+
+  const cargoLabelMutation = useMutation({
+    mutationFn: ({ orderId, printWindow }: { orderId: string; printWindow: Window | null }) => printCargoLabel(orderId, printWindow),
+    onSuccess: () => setLabelMessage('Kargo etiketi yazdırma penceresinde açıldı.'),
+    onError: (error: any) => setLabelMessage(error?.message || 'Kargo etiketi hazırlanamadı'),
+  })
+
+  const openCargoLabel = (orderId: string) => {
+    const printWindow = window.open('', '_blank', 'width=560,height=780')
+    cargoLabelMutation.mutate({ orderId, printWindow })
+  }
+
   const totalPages = data ? Math.ceil(data.meta.total / limit) : 1
 
   return (
@@ -199,6 +231,12 @@ export default function OrdersPage() {
       {emailMessage && (
         <div className="mb-4 rounded-lg border border-emerald-800 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-100">
           {emailMessage}
+        </div>
+      )}
+
+      {labelMessage && (
+        <div className="mb-4 rounded-lg border border-violet-800 bg-violet-950/30 px-4 py-3 text-sm text-violet-100">
+          {labelMessage}
         </div>
       )}
 
@@ -288,7 +326,7 @@ export default function OrdersPage() {
                         </span>
                       </td>
                       <td className="px-4 py-3 text-gray-300 text-xs">
-                        {order.customerName ?? '***'}
+                        {order.customerName || 'Bilgi yok'}
                       </td>
                       <td className="px-4 py-3 text-right">
                         <span className="font-medium text-green-400">
@@ -303,9 +341,10 @@ export default function OrdersPage() {
                         </span>
                       </td>
                       <td className="px-4 py-3 text-xs text-gray-500">
-                        {new Date(order.createdAt).toLocaleDateString('tr-TR')}
+                        {new Date(order.orderedAt || order.createdAt).toLocaleDateString('tr-TR')}
                       </td>
                       <td className="px-4 py-3">
+                        <div className="flex flex-wrap gap-2">
                         {order.status === 'NEW' && (
                           <button
                             onClick={e => { e.stopPropagation(); approveMutation.mutate(order.id) }}
@@ -324,6 +363,34 @@ export default function OrdersPage() {
                             Iptal
                           </button>
                         )}
+                        {!['CANCELLED', 'REFUNDED', 'RETURN_REQUESTED', 'RETURN_APPROVED', 'RETURN_REJECTED'].includes(order.status) && (
+                          <button
+                            onClick={e => { e.stopPropagation(); openCargoLabel(order.id) }}
+                            disabled={cargoLabelMutation.isPending}
+                            className="inline-flex items-center gap-1 text-xs bg-violet-700 hover:bg-violet-600 text-white px-3 py-1 rounded transition-colors disabled:opacity-50"
+                            title="Kargo etiketi yazdır"
+                          >
+                            <Printer size={14} />
+                            Etiket Yazdır
+                          </button>
+                        )}
+                        <label
+                          onClick={e => e.stopPropagation()}
+                          className="text-xs bg-amber-700 hover:bg-amber-600 text-white px-3 py-1 rounded transition-colors cursor-pointer"
+                        >
+                          {order.invoice?.approvedFileName ? 'Faturayı Değiştir' : 'Fatura Yükle'}
+                          <input
+                            type="file"
+                            accept="application/pdf"
+                            className="hidden"
+                            onChange={e => {
+                              const file = e.target.files?.[0]
+                              if (file) invoiceUploadMutation.mutate({ orderId: order.id, file })
+                              e.currentTarget.value = ''
+                            }}
+                          />
+                        </label>
+                        </div>
                       </td>
                     </tr>
                   ))
@@ -377,7 +444,7 @@ export default function OrdersPage() {
               </div>
               <div>
                 <div className="text-xs text-gray-500 mb-1">Musteri</div>
-                <div className="text-sm text-gray-300">{selectedOrder.customerName ?? '***'}</div>
+                <div className="text-sm text-gray-300">{selectedOrder.customerName || 'Bilgi yok'}</div>
                 <div className="text-xs text-gray-500">{selectedOrder.customerPhone ?? ''}</div>
               </div>
               <div>

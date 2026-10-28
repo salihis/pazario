@@ -15,7 +15,16 @@ import attributeRoutes from './api/routes/attributes.routes'
 import productRoutes from './api/routes/product.routes'
 import sourceRoutes from './api/routes/source.routes'
 import marketplaceRoutes from './api/routes/marketplace.routes'
+import marketplaceCredentialRoutes from './api/routes/marketplaceCredential.routes'
+import localSyncRoutes from './api/routes/localSync.routes'
 import financeRoutes from './api/routes/finance.routes'
+import authRoutes from './api/routes/auth.routes'
+import operationRoutes from './api/routes/operation.routes'
+import attributeRuleRoutes from './api/routes/attributeRule.routes'
+import invoiceRoutes from './api/routes/invoice.routes'
+import publicInvoiceRoutes from './api/routes/publicInvoice.routes'
+import { requireAuth } from './api/middleware/auth.middleware'
+import { mediaDirectory } from './api/controllers/productMedia.controller'
 
 // ─── UYGULAMA ────────────────────────────────────────────────────────────────
 
@@ -50,6 +59,15 @@ app.get('/api', (_req, res) => {
   })
 })
 
+app.use('/api', authRoutes)
+app.use('/api', localSyncRoutes)
+app.use('/api', publicInvoiceRoutes)
+app.use('/api/product-media', (req, res, next) => {
+  if (!/^\/[a-f0-9-]{36}\.(jpg|png|mp4)$/.test(req.path)) { res.sendStatus(404); return }
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  next()
+}, express.static(mediaDirectory(), { index: false, dotfiles: 'deny', maxAge: '1d' }))
+app.use('/api', requireAuth)
 app.use('/api', priceRoutes)
 app.use('/api', categoryRoutes)
 app.use('/api', orderRoutes)
@@ -57,7 +75,11 @@ app.use('/api', attributeRoutes)
 app.use('/api', productRoutes)
 app.use('/api', sourceRoutes)
 app.use('/api', marketplaceRoutes)
+app.use('/api', marketplaceCredentialRoutes)
 app.use('/api', financeRoutes)
+app.use('/api', operationRoutes)
+app.use('/api', attributeRuleRoutes)
+app.use('/api', invoiceRoutes)
 
 // Health check
 app.get('/health', async (_req, res) => {

@@ -726,7 +726,13 @@ export async function saveProductAttributes(req: Request, res: Response) {
       if (existing) {
         await prisma.productAttribute.update({
           where: { id: existing.id },
-          data: { valueId: attr.valueId ?? null, valueText: attr.valueText ?? null },
+          data: {
+            valueId: attr.valueId ?? null,
+            valueText: attr.valueText ?? null,
+            isInherited: false,
+            savedBy: 'admin:attribute-editor',
+            savedAt: new Date(),
+          },
         })
         updated++
       } else {
@@ -738,6 +744,8 @@ export async function saveProductAttributes(req: Request, res: Response) {
             attributeName: def?.attributeName ?? null,
             valueId: attr.valueId ?? null,
             valueText: attr.valueText ?? null,
+            isInherited: false,
+            savedBy: 'admin:attribute-editor',
           },
         })
         saved++

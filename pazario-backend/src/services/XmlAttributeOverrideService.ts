@@ -120,8 +120,8 @@ export async function getXmlAttributeOverride(
   if (!def) return null
 
   const attrName = normalizeText(def.attributeName)
-  const rawColor = readXmlAttribute(product, ['renk'])
-  const rawSize = readXmlAttribute(product, ['beden'])
+  const rawColor = readXmlAttribute(product, ['renk', 'color', 'colour', 'web color', 'value1', 'optionValue1'])
+  const rawSize = readXmlAttribute(product, ['beden', 'size', 'value2', 'optionValue2'])
   const rawValue = attrName.includes('web color') || attrName.includes('renk')
     ? rawColor
     : attrName.includes('beden')
@@ -171,6 +171,20 @@ export async function applyXmlColorSizeOverrides(
   for (const def of defs) {
     const override = await getXmlAttributeOverride(prisma, product, marketplace, marketplaceCategoryId, def.attributeId)
     if (!override) continue
+    const existing = await prisma.productAttribute.findUnique({
+      where: {
+        productId_marketplace_attributeId: {
+          productId: product.id,
+          marketplace,
+          attributeId: def.attributeId,
+        },
+      },
+      select: { savedBy: true, isInherited: true },
+    })
+
+    // A manual choice must outlive XML refreshes and form reloads.
+    if (existing && !existing.isInherited && !existing.savedBy?.startsWith('system:xml-color-size')) continue
+
     await prisma.productAttribute.upsert({
       where: {
         productId_marketplace_attributeId: {

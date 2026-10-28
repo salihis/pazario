@@ -1,15 +1,18 @@
 import { Request, Response } from 'express'
+import { effectiveProductMedia } from '../../services/ProductMediaService'
 import { PrismaClient } from '@prisma/client'
 import axios from 'axios'
 import { createHash } from 'crypto'
 import { MIN_MARKETPLACE_STOCK } from '../../validators/ProductValidator'
 import { findApprovedCategoryMapping } from '../../services/CategoryMappingService'
-import { applyXmlColorSizeOverrides } from '../../services/XmlAttributeOverrideService'
+import { CategoryAttributeService } from '../../services/CategoryAttributeService'
+import { calculatePurchaseCost, type PurchaseCostSource } from '../../services/PurchaseCostService'
 import type { Prisma } from '@prisma/client'
 
 const prisma = new PrismaClient()
+const categoryAttributeService = new CategoryAttributeService(prisma)
 const SOCIAL_BRAND_NAME = 'Berselya Underwear&Accessoires'
-const MARKETPLACES = ['TRENDYOL', 'N11', 'PAZARAMA'] as const
+const MARKETPLACES = ['TRENDYOL', 'HEPSIBURADA', 'N11', 'PAZARAMA'] as const
 type Marketplace = typeof MARKETPLACES[number]
 type GroupedProduct = Prisma.ProductGetPayload<{
   include: {
@@ -18,6 +21,13 @@ type GroupedProduct = Prisma.ProductGetPayload<{
         marketplace: true
         status: true
         lastUpdatedAt: true
+      }
+    }
+    source: {
+      select: {
+        priceIncludesVat: true
+        purchaseVatRate: true
+        purchaseExtraFee: true
       }
     }
   }
@@ -32,11 +42,65 @@ type GroupedProduct = Prisma.ProductGetPayload<{
 type SocialProductType = 'JEWELRY' | 'UNDERWEAR' | 'OTHER'
 type PublishCheckResult = Awaited<ReturnType<typeof buildMarketplacePublishCheck>> extends infer T ? NonNullable<T> : never
 
+function isMissingAttributeValue(value: string | string[] | boolean | null): boolean {
+  return value === null || value === '' || (Array.isArray(value) && value.length === 0)
+}
+
+async function getMissingMandatoryAttributes(
+  productId: string,
+  marketplace: Marketplace,
+  categoryId: string,
+): Promise<string[]> {
+  const { attributes } = await categoryAttributeService.getAttributes(marketplace, categoryId, productId)
+  return attributes
+    .filter(attribute => attribute.isMandatory && isMissingAttributeValue(attribute.currentValue))
+    .map(attribute => attribute.attributeName)
+}
+
 function normalizeText(value: unknown): string {
   return String(value ?? '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLocaleLowerCase('tr-TR')
+}
+
+function marketplaceKeyVariants(value: unknown): string[] {
+  const raw = String(value ?? '').trim()
+  if (!raw) return []
+  const normalized = raw.toLocaleLowerCase('tr-TR')
+  return Array.from(new Set([
+    raw,
+    normalized,
+    raw.replace(/\s+/g, ''),
+    normalized.replace(/\s+/g, ''),
+  ].filter(Boolean)))
+}
+
+async function findPublishedExternalListingForProduct(
+  product: { sku: string; barcode: string | null; externalId: string },
+  marketplace: Marketplace
+) {
+  const keys = Array.from(new Set([
+    ...marketplaceKeyVariants(product.sku),
+    ...marketplaceKeyVariants(product.barcode),
+    ...marketplaceKeyVariants(product.externalId),
+  ]))
+
+  if (keys.length === 0) return null
+
+  return prisma.marketplaceExternalProduct.findFirst({
+    where: {
+      marketplace,
+      status: 'PUBLISHED',
+      OR: [
+        { listingKey: { in: keys } },
+        { stockCode: { in: keys } },
+        { barcode: { in: keys } },
+        { externalListingId: { in: keys } },
+      ],
+    },
+    orderBy: { lastSeenAt: 'desc' },
+  })
 }
 
 function productContentHash(product: { externalId: string; price: unknown; stock: number; title: string }): string {
@@ -137,6 +201,10 @@ function getVariantParentKey(product: { id: string; sku: string; attributes: unk
   return parent || product.id
 }
 
+function getVariantGroupKey(product: { sourceId: string; id: string; sku: string; attributes: unknown }) {
+  return `${product.sourceId}:${getVariantParentKey(product)}`
+}
+
 function getVariantColor(product: { attributes: unknown }) {
   return readProductAttribute(product.attributes, ['Renk', 'renk', 'color', 'Color', 'value1']) || 'Renk belirtilmemis'
 }
@@ -194,6 +262,7 @@ async function calculateMarketplacePrice(product: {
   price: unknown
   brand: string | null
   categoryRaw: string | null
+  source?: PurchaseCostSource | null
 }, marketplace: Marketplace) {
   const rules = await prisma.priceRule.findMany({
     where: {
@@ -203,7 +272,7 @@ async function calculateMarketplacePrice(product: {
     orderBy: { priority: 'asc' },
   })
 
-  const basePrice = Number(product.price)
+  const basePrice = calculatePurchaseCost(product.price, product.source)
   if (!Number.isFinite(basePrice) || basePrice <= 0) return null
   const matchesRange = (rule: { priceStart: unknown; priceEnd: unknown }) => {
     const start = rule.priceStart === null ? null : Number(rule.priceStart)
@@ -251,6 +320,11 @@ export async function getProducts(req: Request, res: Response) {
     const sourceId = req.query.sourceId as string | undefined
     const stockFilter = String(req.query.stockFilter || 'marketplace')
     const minStock = readMinStockFilter(req.query.minStock)
+    const transferStatus = String(req.query.transferStatus || '')
+    const transferMarketplace = normalizeMarketplace(req.query.transferMarketplace)
+    const hasTransferFilter = Boolean(
+      transferMarketplace && ['published', 'not_published'].includes(transferStatus),
+    )
 
     const where: Prisma.ProductWhereInput = {
       ...(sourceId ? { sourceId } : {}),
@@ -272,9 +346,19 @@ export async function getProducts(req: Request, res: Response) {
 
     if (!shouldGroupVariants) {
       const skip = (page - 1) * limit
+      const ungroupedWhere: Prisma.ProductWhereInput = {
+        ...where,
+        ...(hasTransferFilter
+          ? {
+              listings: transferStatus === 'published'
+                ? { some: { marketplace: transferMarketplace!, status: 'PUBLISHED' } }
+                : { none: { marketplace: transferMarketplace!, status: 'PUBLISHED' } },
+            }
+          : {}),
+      }
       const [data, total] = await Promise.all([
         prisma.product.findMany({
-          where,
+          where: ungroupedWhere,
           skip,
           take: limit,
           orderBy: { updatedAt: 'desc' },
@@ -286,13 +370,25 @@ export async function getProducts(req: Request, res: Response) {
                 lastUpdatedAt: true,
               },
             },
+            source: {
+              select: {
+                priceIncludesVat: true,
+                purchaseVatRate: true,
+                purchaseExtraFee: true,
+              },
+            },
           },
         }),
-        prisma.product.count({ where }),
+        prisma.product.count({ where: ungroupedWhere }),
       ])
       res.json({
         success: true,
-        data,
+        data: data.map(product => ({
+          ...product,
+          ...effectiveProductMedia(product),
+          basePurchasePrice: Number(product.price),
+          price: calculatePurchaseCost(product.price, product.source),
+        })),
         meta: {
           total,
           rawTotal: total,
@@ -317,13 +413,20 @@ export async function getProducts(req: Request, res: Response) {
             lastUpdatedAt: true,
           },
         },
+        source: {
+          select: {
+            priceIncludesVat: true,
+            purchaseVatRate: true,
+            purchaseExtraFee: true,
+          },
+        },
       },
     })
 
     const grouped = Array.from(allProducts.reduce((groups, product) => {
       const parentKey = getVariantParentKey(product)
       const color = getVariantColor(product)
-      const groupKey = `${product.sourceId}:${parentKey}:${normalizeText(color)}`
+      const groupKey = getVariantGroupKey(product)
       const current = groups.get(groupKey)
 
       if (!current) {
@@ -353,20 +456,32 @@ export async function getProducts(req: Request, res: Response) {
       const { variantListingStatuses, ...product } = group
       return {
         ...product,
+        basePurchasePrice: Number(product.price),
+        ...effectiveProductMedia(product),
+        price: calculatePurchaseCost(product.price, product.source),
         listings: groupedListingsFromVariantStatuses({ variantListingStatuses }),
       }
     })
 
+    const filteredGroupedData = hasTransferFilter
+      ? groupedData.filter(product => {
+          const isPublished = product.listings.some(listing =>
+            listing.marketplace === transferMarketplace && listing.status === 'PUBLISHED'
+          )
+          return transferStatus === 'published' ? isPublished : !isPublished
+        })
+      : groupedData
+
     const skip = (page - 1) * limit
-    const data = groupedData.slice(skip, skip + limit)
+    const data = filteredGroupedData.slice(skip, skip + limit)
 
     res.json({
       success: true,
       data,
       meta: {
-        total: groupedData.length,
+        total: filteredGroupedData.length,
         rawTotal: totalProducts,
-        groupedTotal: groupedData.length,
+        groupedTotal: filteredGroupedData.length,
         page,
         limit,
         grouped: true,
@@ -472,14 +587,11 @@ export async function updateProduct(req: Request, res: Response) {
 export async function getProductCategories(req: Request, res: Response) {
   try {
     const sourceId = req.query.sourceId as string | undefined
-    const stockFilter = String(req.query.stockFilter || 'marketplace')
-    const minStock = readMinStockFilter(req.query.minStock)
     const groups = await prisma.product.groupBy({
       by: ['categoryRaw'],
       where: {
         categoryRaw: { not: null },
         ...(sourceId ? { sourceId } : {}),
-        ...(stockFilter === 'marketplace' ? { stock: { gt: minStock } } : {}),
       },
       _count: { _all: true },
       orderBy: { categoryRaw: 'asc' },
@@ -505,7 +617,7 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
   const product = await prisma.product.findUnique({
     where: { id: productId },
     include: {
-      source: { select: { id: true, name: true } },
+      source: { select: { id: true, name: true, priceIncludesVat: true, purchaseVatRate: true, purchaseExtraFee: true } },
       productAttributes: { where: { marketplace } },
     },
   })
@@ -516,13 +628,17 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
   const listing = await prisma.marketplaceListing.findUnique({
     where: { productId_marketplace: { productId, marketplace } },
   })
+  const externalPublishedListing = listing?.status === 'PUBLISHED'
+    ? null
+    : await findPublishedExternalListingForProduct(product, marketplace)
   const categoryMapping = await findApprovedCategoryMapping(prisma, {
     sourceId: product.sourceId,
     sourceCategory: product.categoryRaw,
     marketplace,
   })
   const price = await calculateMarketplacePrice(product, marketplace)
-  const alreadyPublished = listing?.status === 'PUBLISHED'
+  const existingListingStatus = listing?.status ?? externalPublishedListing?.status ?? null
+  const alreadyPublished = existingListingStatus === 'PUBLISHED'
 
   checks.push({
     key: 'stock',
@@ -535,7 +651,9 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
     key: 'existing_listing',
     ok: true,
     message: alreadyPublished
-      ? 'Bu urun bu pazaryerinde zaten yayinda gorunuyor.'
+      ? externalPublishedListing
+        ? 'Bu urun pazaryerinden iceri alinan kayitta yayinda gorunuyor.'
+        : 'Bu urun bu pazaryerinde zaten yayinda gorunuyor.'
       : 'Bu urun icin yayinda pazaryeri kaydi yok.',
   })
   checks.push({
@@ -555,21 +673,11 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
 
   let missingMandatory: string[] = []
   if (categoryMapping?.marketplaceCategoryId) {
-    await applyXmlColorSizeOverrides(prisma, product, marketplace, categoryMapping.marketplaceCategoryId)
-    const refreshedAttrs = await prisma.productAttribute.findMany({
-      where: { productId, marketplace },
-    })
-    const mandatoryAttrs = await prisma.marketplaceCategoryAttribute.findMany({
-      where: { marketplace, categoryId: categoryMapping.marketplaceCategoryId, isMandatory: true },
-    })
-    const filled = new Set(
-      refreshedAttrs
-        .filter(attr => attr.valueId || attr.valueText)
-        .map(attr => attr.attributeId)
+    missingMandatory = await getMissingMandatoryAttributes(
+      productId,
+      marketplace,
+      categoryMapping.marketplaceCategoryId,
     )
-    missingMandatory = mandatoryAttrs
-      .filter(attr => !filled.has(attr.attributeId))
-      .map(attr => attr.attributeName)
   }
 
   checks.push({
@@ -586,21 +694,22 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
     productId: product.id,
     sku: product.sku,
     title: product.title,
-    imageUrl: product.images?.[0] ?? null,
+    imageUrl: effectiveProductMedia(product).images[0] ?? null,
     categoryRaw: product.categoryRaw,
     sourceId: product.sourceId,
     sourceName: product.source?.name ?? null,
     variantParentKey: getVariantParentKey(product),
     variantColor: getVariantColor(product),
     publishProductIds: canPublish ? [product.id] : [],
+    groupProductIds: [product.id],
     variantTotal: 1,
     readyVariantCount: canPublish ? 1 : 0,
     blockedVariantCount: canPublish ? 0 : 1,
     marketplace,
     canPublish,
-    purchasePrice: Number(product.price),
+    purchasePrice: calculatePurchaseCost(product.price, product.source),
     calculatedPrice: price,
-    existingListingStatus: listing?.status ?? null,
+    existingListingStatus,
     checks,
   }
 }export async function checkProductMarketplacePublish(req: Request, res: Response) {
@@ -615,7 +724,7 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
     const product = await prisma.product.findUnique({
       where: { id: productId },
       include: {
-        source: { select: { id: true, name: true } },
+        source: { select: { id: true, name: true, priceIncludesVat: true, purchaseVatRate: true, purchaseExtraFee: true } },
         productAttributes: { where: { marketplace } },
       },
     })
@@ -629,13 +738,17 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
     const listing = await prisma.marketplaceListing.findUnique({
       where: { productId_marketplace: { productId, marketplace } },
     })
+    const externalPublishedListing = listing?.status === 'PUBLISHED'
+      ? null
+      : await findPublishedExternalListingForProduct(product, marketplace)
     const categoryMapping = await findApprovedCategoryMapping(prisma, {
       sourceId: product.sourceId,
       sourceCategory: product.categoryRaw,
       marketplace,
     })
     const price = await calculateMarketplacePrice(product, marketplace)
-    const alreadyPublished = listing?.status === 'PUBLISHED'
+    const existingListingStatus = listing?.status ?? externalPublishedListing?.status ?? null
+    const alreadyPublished = existingListingStatus === 'PUBLISHED'
 
     checks.push({
       key: 'stock',
@@ -648,7 +761,9 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
       key: 'existing_listing',
       ok: true,
       message: alreadyPublished
-        ? 'Bu urun bu pazaryerinde zaten yayinda gorunuyor.'
+        ? externalPublishedListing
+          ? 'Bu urun pazaryerinden iceri alinan kayitta yayinda gorunuyor.'
+          : 'Bu urun bu pazaryerinde zaten yayinda gorunuyor.'
         : 'Bu urun icin yayinda pazaryeri kaydi yok.',
     })
     checks.push({
@@ -668,21 +783,11 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
 
     let missingMandatory: string[] = []
     if (categoryMapping?.marketplaceCategoryId) {
-      await applyXmlColorSizeOverrides(prisma, product, marketplace, categoryMapping.marketplaceCategoryId)
-      const refreshedAttrs = await prisma.productAttribute.findMany({
-        where: { productId, marketplace },
-      })
-      const mandatoryAttrs = await prisma.marketplaceCategoryAttribute.findMany({
-        where: { marketplace, categoryId: categoryMapping.marketplaceCategoryId, isMandatory: true },
-      })
-      const filled = new Set(
-        refreshedAttrs
-          .filter(attr => attr.valueId || attr.valueText)
-          .map(attr => attr.attributeId)
+      missingMandatory = await getMissingMandatoryAttributes(
+        productId,
+        marketplace,
+        categoryMapping.marketplaceCategoryId,
       )
-      missingMandatory = mandatoryAttrs
-        .filter(attr => !filled.has(attr.attributeId))
-        .map(attr => attr.attributeName)
     }
 
     checks.push({
@@ -694,27 +799,65 @@ async function buildMarketplacePublishCheck(productId: string, marketplace: Mark
     })
 
     const canPublish = !alreadyPublished && checks.every(check => check.ok)
+    let publishProductIds = canPublish || alreadyPublished ? [product.id] : []
+    let variantTotal = 1
+    let readyVariantCount = canPublish ? 1 : 0
+    let blockedVariantCount = canPublish ? 0 : 1
+
+    const variantParentKey = getVariantParentKey(product)
+    if (variantParentKey !== product.id) {
+      const siblingCandidates = await prisma.product.findMany({
+        where: {
+          sourceId: product.sourceId,
+          categoryRaw: product.categoryRaw,
+        },
+        select: {
+          id: true,
+          sku: true,
+          attributes: true,
+        },
+      })
+      const siblingIds = siblingCandidates
+        .filter(candidate => candidate.id !== product.id && getVariantParentKey(candidate) === variantParentKey)
+        .map(candidate => candidate.id)
+
+      for (const siblingId of siblingIds) {
+        const siblingCheck = await buildMarketplacePublishCheck(siblingId, marketplace)
+        if (!siblingCheck) continue
+        variantTotal += 1
+        if (siblingCheck.canPublish) {
+          readyVariantCount += 1
+          publishProductIds.push(siblingCheck.productId)
+        } else if (siblingCheck.existingListingStatus === 'PUBLISHED') {
+          publishProductIds.push(siblingCheck.productId)
+        } else {
+          blockedVariantCount += 1
+        }
+      }
+      publishProductIds = Array.from(new Set(publishProductIds))
+    }
+
     res.json({
       success: true,
       data: {
         productId: product.id,
         sku: product.sku,
         title: product.title,
-        imageUrl: product.images?.[0] ?? null,
+        imageUrl: effectiveProductMedia(product).images[0] ?? null,
         categoryRaw: product.categoryRaw,
         sourceId: product.sourceId,
         sourceName: product.source?.name ?? null,
-        variantParentKey: getVariantParentKey(product),
+        variantParentKey,
         variantColor: getVariantColor(product),
-        publishProductIds: canPublish ? [product.id] : [],
-        variantTotal: 1,
-        readyVariantCount: canPublish ? 1 : 0,
-        blockedVariantCount: canPublish ? 0 : 1,
+        publishProductIds,
+        variantTotal,
+        readyVariantCount,
+        blockedVariantCount,
         marketplace,
-        canPublish,
-        purchasePrice: Number(product.price),
+        canPublish: canPublish || readyVariantCount > 0,
+        purchasePrice: calculatePurchaseCost(product.price, product.source),
         calculatedPrice: price,
-        existingListingStatus: listing?.status ?? null,
+        existingListingStatus,
         checks,
       },
     })
@@ -755,27 +898,38 @@ export async function bulkCheckProductMarketplacePublish(req: Request, res: Resp
     }
 
     const groupedResults = Array.from(results.reduce((groups, result) => {
-      const groupKey = `${result.sourceId}:${result.variantParentKey}:${normalizeText(result.variantColor)}`
+      const groupKey = `${result.sourceId}:${result.variantParentKey}`
+      const isPublished = result.existingListingStatus === 'PUBLISHED'
       const current = groups.get(groupKey)
       if (!current) {
+        const publishProductIds = result.canPublish || result.existingListingStatus === 'PUBLISHED'
+          ? [result.productId]
+          : []
         groups.set(groupKey, {
           ...result,
-          publishProductIds: result.canPublish ? [result.productId] : [],
+          publishProductIds,
+          groupProductIds: [result.productId],
           variantTotal: 1,
           readyVariantCount: result.canPublish ? 1 : 0,
-          blockedVariantCount: result.canPublish ? 0 : 1,
+          blockedVariantCount: result.canPublish || isPublished ? 0 : 1,
         })
         return groups
       }
 
       current.variantTotal += 1
+      current.groupProductIds.push(result.productId)
+      current.groupProductIds = Array.from(new Set(current.groupProductIds))
       if (result.canPublish) {
         current.readyVariantCount += 1
         current.publishProductIds.push(result.productId)
+      } else if (result.existingListingStatus === 'PUBLISHED') {
+        current.publishProductIds.push(result.productId)
+        current.existingListingStatus = 'PUBLISHED'
       } else {
         current.blockedVariantCount += 1
       }
-      current.canPublish = current.publishProductIds.length > 0
+      current.publishProductIds = Array.from(new Set(current.publishProductIds))
+      current.canPublish = current.readyVariantCount > 0
       current.checks = current.canPublish
         ? [
             { key: 'variant_group', ok: true, message: `${current.readyVariantCount}/${current.variantTotal} varyant gonderime hazir.` },
@@ -786,6 +940,7 @@ export async function bulkCheckProductMarketplacePublish(req: Request, res: Resp
 
     const reasonCounts: Record<string, number> = {}
     for (const result of groupedResults) {
+      if (!result.canPublish && result.existingListingStatus === 'PUBLISHED') continue
       for (const check of result.checks) {
         if (!check.ok) reasonCounts[check.key] = (reasonCounts[check.key] ?? 0) + 1
       }
@@ -799,7 +954,7 @@ export async function bulkCheckProductMarketplacePublish(req: Request, res: Resp
         requested: productIds.length,
         hiddenStockInsufficient,
         ready: groupedResults.filter(result => result.canPublish).length,
-        blocked: groupedResults.filter(result => !result.canPublish).length,
+        blocked: groupedResults.filter(result => !result.canPublish && result.existingListingStatus !== 'PUBLISHED').length,
         reasonCounts,
         results: groupedResults,
       },
@@ -832,7 +987,7 @@ export async function publishProductToSocial(req: Request, res: Response) {
       return
     }
 
-    const imageUrl = product.images[0] || null
+    const imageUrl = effectiveProductMedia(product).images[0] || null
     if (!imageUrl) {
       res.status(400).json({ success: false, error: 'Sosyal medya gonderimi icin urun gorseli yok' })
       return
@@ -872,7 +1027,7 @@ export async function publishProductToSocial(req: Request, res: Response) {
       file_url: imageUrl,
       photo_url: imageUrl,
       media_url: imageUrl,
-      images: product.images,
+      images: effectiveProductMedia(product).images,
       product_url: productUrl,
       publish_to_pinterest: targets.includes('pinterest'),
       publish_to_instagram: targets.includes('instagram'),

@@ -6,6 +6,9 @@ import axios from 'axios'
 import { CategoryAttributeService } from '../../services/CategoryAttributeService'
 import { getXmlAttributeOverride } from '../../services/XmlAttributeOverrideService'
 import { decodeXmlBuffer } from '../../utils/xmlFetch'
+import { decryptJson } from '../../services/FieldEncryptionService'
+import { hepsiburadaAuthHeaders, hepsiburadaProductApiUrl } from '../../config/hepsiburada'
+import type { AuthRequest } from '../middleware/auth.middleware'
 
 const prisma = new PrismaClient()
 const categoryAttributeService = new CategoryAttributeService(prisma)
@@ -15,6 +18,10 @@ const TRENDYOL_CATEGORY_URL = 'https://apigw.trendyol.com/integration/product/pr
 const N11_CATEGORY_URL = 'https://api.n11.com/cdn/categories'
 const PAZARAMA_TOKEN_URL = 'https://isortagimgiris.pazarama.com/connect/token'
 const PAZARAMA_CATEGORY_URL = 'https://isortagimapi.pazarama.com/category/getCategoryTree'
+const HEPSIBURADA_CATEGORY_URLS = [
+  '/categories/get-all-categories',
+  '/categories',
+]
 
 type CategorySuggestion = {
   categoryId: string
@@ -31,8 +38,40 @@ type MarketplaceCategoryRow = {
   isLeaf: boolean
 }
 type AttributePayload = { attributeId: string; valueId?: string; valueText?: string }
+type CategoryMappingListItem = Awaited<ReturnType<typeof prisma.categoryMapping.findMany>>[number] & {
+  source?: { id: string; name: string }
+}
 
 let pazaramaTokenCache: { token: string; expiresAt: number } | null = null
+
+async function activeMarketplaceCredentials(marketplace: Marketplace): Promise<Record<string, string>> {
+  const record = await prisma.marketplaceCredential.findUnique({ where: { marketplace } })
+  if (!record?.isActive) return {}
+  return decryptJson(record.credentialsEncrypted)
+}
+
+async function marketplaceApiCredentials(marketplace: Marketplace) {
+  const credentials = await activeMarketplaceCredentials(marketplace)
+  return {
+    apiKey: String(credentials.apiKey || process.env.TY_API_KEY || '').trim(),
+    apiSecret: String(credentials.apiSecret || process.env.TY_API_SECRET || '').trim(),
+    appKey: String(credentials.appKey || process.env.N11_APPKEY || '').trim(),
+    appSecret: String(credentials.appSecret || process.env.N11_APPSECRET || '').trim(),
+    clientId: String(credentials.clientId || process.env.PZ_CLIENT_ID || '').trim(),
+    clientSecret: String(credentials.clientSecret || process.env.PZ_CLIENT_SECRET || '').trim(),
+    merchantId: String(credentials.merchantId || process.env.HB_MERCHANT_ID || '').trim(),
+    username: String(credentials.username || process.env.HB_USERNAME || '').trim(),
+    password: String(credentials.password || process.env.HB_PASSWORD || '').trim(),
+    userAgent: String(credentials.userAgent || credentials.developerUsername || process.env.HB_USER_AGENT || process.env.HB_DEVELOPER_USERNAME || '').trim(),
+    serviceKey: String(credentials.serviceKey || process.env.HB_SERVICE_KEY || '').trim(),
+  }
+}
+
+async function hepsiburadaHeaders() {
+  const { merchantId, serviceKey, username, password, userAgent } = await marketplaceApiCredentials('HEPSIBURADA')
+  if (!merchantId || (!serviceKey && (!username || !password))) throw new Error('Hepsiburada API bilgileri eksik')
+  return hepsiburadaAuthHeaders(merchantId, serviceKey, merchantId, serviceKey || password, userAgent)
+}
 
 async function getJsonWithCharset(url: string, options: Parameters<typeof axios.get>[1] = {}) {
   const response = await axios.get<ArrayBuffer>(url, {
@@ -45,7 +84,6 @@ async function getJsonWithCharset(url: string, options: Parameters<typeof axios.
 }
 
 async function syncCategoryAttributesForApproval(marketplace: Marketplace, categoryId: string) {
-  if (marketplace === 'HEPSIBURADA') return { attributesSynced: 0, attributesSyncError: null as string | null }
   try {
     const attributesSynced = await categoryAttributeService.refreshFromAPI(marketplace, categoryId)
     return { attributesSynced, attributesSyncError: null as string | null }
@@ -82,9 +120,115 @@ function buildMappingWhere(req: Request, defaultStatus?: string) {
   return where
 }
 
-function normalizeCategoryText(value: unknown): string {
+async function enrichCategoryMappingList(data: CategoryMappingListItem[]) {
+  if (data.length === 0) return []
+
+  const categoryKeys = data.map(mapping => ({
+    sourceId: mapping.sourceId,
+    categoryRaw: mapping.sourceCategory,
+  }))
+  const products = await prisma.product.findMany({
+    where: {
+      OR: categoryKeys.map(key => ({
+        sourceId: key.sourceId,
+        categoryRaw: key.categoryRaw,
+      })),
+    },
+    select: { id: true, sourceId: true, categoryRaw: true },
+  })
+  const productIds = products.map(product => product.id)
+  const productCountByCategory = new Map<string, number>()
+  const productCategoryKeyById = new Map<string, string>()
+  for (const product of products) {
+    const key = `${product.sourceId}::${product.categoryRaw ?? ''}`
+    productCountByCategory.set(key, (productCountByCategory.get(key) ?? 0) + 1)
+    productCategoryKeyById.set(product.id, key)
+  }
+
+  const categoryAttributePairs = data
+    .filter(mapping => mapping.marketplaceCategoryId)
+    .map(mapping => ({
+      marketplace: mapping.marketplace,
+      categoryId: mapping.marketplaceCategoryId as string,
+    }))
+  const mandatoryAttributes = categoryAttributePairs.length > 0
+    ? await prisma.marketplaceCategoryAttribute.findMany({
+        where: {
+          isMandatory: true,
+          OR: categoryAttributePairs.map(pair => ({
+            marketplace: pair.marketplace,
+            categoryId: pair.categoryId,
+          })),
+        },
+        select: { marketplace: true, categoryId: true, attributeId: true },
+      })
+    : []
+
+  const mandatoryByMarketplaceCategory = new Map<string, Set<string>>()
+  const mandatoryAttributeIds = new Set<string>()
+  for (const attribute of mandatoryAttributes) {
+    const key = `${attribute.marketplace}::${attribute.categoryId}`
+    if (!mandatoryByMarketplaceCategory.has(key)) mandatoryByMarketplaceCategory.set(key, new Set())
+    mandatoryByMarketplaceCategory.get(key)?.add(attribute.attributeId)
+    mandatoryAttributeIds.add(attribute.attributeId)
+  }
+
+  const filledAttributes = productIds.length > 0 && mandatoryAttributeIds.size > 0
+    ? await prisma.productAttribute.findMany({
+        where: {
+          productId: { in: productIds },
+          marketplace: { in: Array.from(new Set(data.map(mapping => mapping.marketplace))) },
+          attributeId: { in: Array.from(mandatoryAttributeIds) },
+          OR: [{ valueId: { not: null } }, { valueText: { not: null } }],
+        },
+        select: { productId: true, marketplace: true, attributeId: true },
+      })
+    : []
+
+  const filledByMappingKey = new Map<string, Set<string>>()
+  for (const attribute of filledAttributes) {
+    const categoryKey = productCategoryKeyById.get(attribute.productId)
+    if (!categoryKey) continue
+    const mappingKey = `${categoryKey}::${attribute.marketplace}`
+    if (!filledByMappingKey.has(mappingKey)) filledByMappingKey.set(mappingKey, new Set())
+    filledByMappingKey.get(mappingKey)?.add(attribute.attributeId)
+  }
+
+  return data.map(mapping => {
+    const categoryKey = `${mapping.sourceId}::${mapping.sourceCategory}`
+    const mappingKey = `${categoryKey}::${mapping.marketplace}`
+    const productCount = productCountByCategory.get(categoryKey) ?? 0
+    const mandatoryAttributeIdsForMapping = mapping.marketplaceCategoryId
+      ? mandatoryByMarketplaceCategory.get(`${mapping.marketplace}::${mapping.marketplaceCategoryId}`) ?? new Set<string>()
+      : new Set<string>()
+    const filledAttributeIds = filledByMappingKey.get(mappingKey) ?? new Set<string>()
+    const filled = Array.from(filledAttributeIds).filter(attributeId => mandatoryAttributeIdsForMapping.has(attributeId)).length
+    const mandatory = mandatoryAttributeIdsForMapping.size
+
+    return {
+      ...mapping,
+      productCount,
+      attributeSummary: {
+        mandatory,
+        filled,
+        missing: Math.max(0, mandatory - filled),
+        complete: mandatory === 0 ? mapping.status === 'APPROVED' : filled >= mandatory,
+      },
+    }
+  })
+}
+
+function decodeHtmlEntities(value: unknown): string {
   return String(value ?? '')
-    .replace(/&amp;/g, '&')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+}
+
+function normalizeCategoryText(value: unknown): string {
+  return decodeHtmlEntities(value)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
@@ -141,12 +285,12 @@ function isCompatibleCategory(sourceCategory: string, categoryPath: string): boo
 }
 
 function categoryLeaf(value: unknown): string {
-  const parts = String(value ?? '')
+  const parts = decodeHtmlEntities(value)
     .split(/>>>|>|\/|\\/g)
     .map(part => part.trim())
     .filter(Boolean)
 
-  return parts[parts.length - 1] ?? String(value ?? '')
+  return parts[parts.length - 1] ?? decodeHtmlEntities(value)
 }
 
 function isGenericCategoryToken(token: string): boolean {
@@ -177,9 +321,10 @@ function scoreCategory(sourceCategory: string, categoryPath: string, categoryNam
 
   const sourceLeafTokens = categoryTokens(categoryLeaf(sourceCategory))
   const targetLeafTokens = new Set([...categoryTokens(categoryLeaf(categoryPath)), ...categoryTokens(categoryName)])
+  const targetPathTokens = new Set(categoryTokens(categoryPath))
   const meaningfulLeafTokens = sourceLeafTokens.filter(token => !isGenericCategoryToken(token))
   const leafMatches = meaningfulLeafTokens.filter(token =>
-    [...targetLeafTokens].some(targetToken => targetToken === token || targetToken.includes(token) || token.includes(targetToken))
+    [...targetLeafTokens, ...targetPathTokens].some(targetToken => targetToken === token || targetToken.includes(token) || token.includes(targetToken))
   )
   const requiredLeafMatches = meaningfulLeafTokens.length >= 2 ? 2 : meaningfulLeafTokens.length
   if (requiredLeafMatches > 0 && leafMatches.length < requiredLeafMatches) return 0
@@ -299,6 +444,46 @@ async function refreshPendingSuggestions(marketplaces: Marketplace[], sourceId?:
   return { scanned: pending.length, updated }
 }
 
+async function createCategoryMappingRecords(marketplaces: Marketplace[], sourceId?: string) {
+  const products = await prisma.product.findMany({
+    where: {
+      ...(sourceId ? { sourceId } : {}),
+      categoryRaw: { not: null },
+      stock: { gt: 6 },
+    },
+    distinct: ['sourceId', 'categoryRaw'],
+    select: { sourceId: true, categoryRaw: true },
+  })
+
+  const data = products
+    .filter(product => product.categoryRaw && product.categoryRaw.trim())
+    .flatMap(product =>
+      marketplaces.map(mp => ({
+        sourceId: product.sourceId,
+        sourceCategory: product.categoryRaw as string,
+        marketplace: mp,
+        status: 'PENDING' as const,
+        aiSuggested: false,
+        allSuggestions: [],
+      }))
+    )
+
+  if (data.length === 0) {
+    return { created: 0, categories: 0, targetMappings: 0 }
+  }
+
+  const result = await prisma.categoryMapping.createMany({
+    data,
+    skipDuplicates: true,
+  })
+
+  return {
+    created: result.count,
+    categories: products.length,
+    targetMappings: data.length,
+  }
+}
+
 function flattenTrendyolCategories(
   nodes: any[],
   parentId: string | null = null,
@@ -365,13 +550,39 @@ function flattenPazaramaCategories(nodes: any[]): MarketplaceCategoryRow[] {
   }).filter(category => category.categoryId && category.categoryName)
 }
 
+function flattenHepsiburadaCategories(
+  nodes: any[],
+  parentId: string | null = null,
+  parentPath = ''
+): MarketplaceCategoryRow[] {
+  return nodes.flatMap(node => {
+    const categoryId = String(node.id ?? node.categoryId ?? '')
+    const categoryName = String(node.name ?? node.categoryName ?? node.displayName ?? '')
+    if (!categoryId || !categoryName) return []
+
+    const children = Array.isArray(node.subCategories)
+      ? node.subCategories
+      : Array.isArray(node.children)
+        ? node.children
+        : Array.isArray(node.categories)
+          ? node.categories
+          : []
+    const categoryPath = String(node.path ?? node.categoryPath ?? (parentPath ? `${parentPath} > ${categoryName}` : categoryName))
+    const isLeaf = Boolean(node.leaf ?? node.isLeaf ?? children.length === 0)
+
+    return [
+      { categoryId, categoryName, categoryPath, parentId, isLeaf },
+      ...flattenHepsiburadaCategories(children, categoryId, categoryPath),
+    ]
+  })
+}
+
 async function getPazaramaAccessToken(): Promise<string> {
   if (pazaramaTokenCache && Date.now() < pazaramaTokenCache.expiresAt) {
     return pazaramaTokenCache.token
   }
 
-  const clientId = process.env.PZ_CLIENT_ID
-  const clientSecret = process.env.PZ_CLIENT_SECRET
+  const { clientId, clientSecret } = await marketplaceApiCredentials('PAZARAMA')
   if (!clientId || !clientSecret) throw new Error('Pazarama API bilgileri eksik')
 
   const response = await axios.post(
@@ -399,8 +610,7 @@ async function getPazaramaAccessToken(): Promise<string> {
 
 async function fetchMarketplaceCategories(marketplace: Marketplace): Promise<MarketplaceCategoryRow[]> {
   if (marketplace === 'TRENDYOL') {
-    const apiKey = process.env.TY_API_KEY
-    const apiSecret = process.env.TY_API_SECRET
+    const { apiKey, apiSecret } = await marketplaceApiCredentials('TRENDYOL')
     const root = await getJsonWithCharset(TRENDYOL_CATEGORY_URL, {
       ...(apiKey && apiSecret ? { auth: { username: apiKey, password: apiSecret } } : {}),
       timeout: 60000,
@@ -410,8 +620,7 @@ async function fetchMarketplaceCategories(marketplace: Marketplace): Promise<Mar
   }
 
   if (marketplace === 'N11') {
-    const appKey = process.env.N11_APPKEY
-    const appSecret = process.env.N11_APPSECRET
+    const { appKey, appSecret } = await marketplaceApiCredentials('N11')
     if (!appKey || !appSecret) throw new Error('N11 API bilgileri eksik')
 
     const root = await getJsonWithCharset(N11_CATEGORY_URL, {
@@ -436,6 +645,51 @@ async function fetchMarketplaceCategories(marketplace: Marketplace): Promise<Mar
     })
     const nodes = Array.isArray(root?.data) ? root.data : Array.isArray(root) ? root : []
     return flattenPazaramaCategories(nodes)
+  }
+
+  if (marketplace === 'HEPSIBURADA') {
+    const headers = await hepsiburadaHeaders()
+    let lastError: unknown
+    for (const path of HEPSIBURADA_CATEGORY_URLS) {
+      try {
+        const rows: MarketplaceCategoryRow[] = []
+        const seen = new Set<string>()
+        const size = 2000
+
+        for (let page = 0; page < 100; page += 1) {
+          const root = await getJsonWithCharset(hepsiburadaProductApiUrl(path), {
+            params: { leaf: true, available: true, page, size },
+            headers,
+            timeout: 60000,
+          })
+          const nodes = Array.isArray(root?.data)
+            ? root.data
+            : Array.isArray(root?.categories)
+              ? root.categories
+              : Array.isArray(root?.items)
+                ? root.items
+                : Array.isArray(root)
+                  ? root
+                  : []
+          const pageRows = flattenHepsiburadaCategories(nodes)
+          let added = 0
+          for (const row of pageRows) {
+            if (seen.has(row.categoryId)) continue
+            seen.add(row.categoryId)
+            rows.push(row)
+            added += 1
+          }
+
+          const totalPages = Number(root?.totalPages ?? root?.data?.totalPages ?? 0)
+          if (added === 0 || (totalPages > 0 && page + 1 >= totalPages) || nodes.length < size) break
+        }
+
+        return rows
+      } catch (error) {
+        lastError = error
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Hepsiburada kategori agaci alinamadi')
   }
 
   throw new Error(`${marketplace} kategori agaci senkronizasyonu devre disi`)
@@ -463,7 +717,9 @@ export async function getCategoryMappings(req: Request, res: Response) {
       prisma.categoryMapping.count({ where }),
     ])
 
-    res.json({ success: true, data, meta: { total, page, limit } })
+    const enriched = await enrichCategoryMappingList(data)
+
+    res.json({ success: true, data: enriched, meta: { total, page, limit } })
   } catch (e) {
     res.status(500).json({ success: false, error: 'Sunucu hatasi' })
   }
@@ -479,46 +735,13 @@ export async function generateCategoryMappings(req: Request, res: Response) {
     const marketplace = String(req.body.marketplace || req.query.marketplace || '')
     const marketplaces = marketplace ? [marketplace as Marketplace] : MARKETPLACES
 
-    const products = await prisma.product.findMany({
-      where: {
-        ...(sourceId ? { sourceId } : {}),
-        categoryRaw: { not: null },
-        stock: { gt: 6 },
-      },
-      distinct: ['sourceId', 'categoryRaw'],
-      select: { sourceId: true, categoryRaw: true },
-    })
-
-    const data = products
-      .filter(product => product.categoryRaw && product.categoryRaw.trim())
-      .flatMap(product =>
-        marketplaces.map(mp => ({
-          sourceId: product.sourceId,
-          sourceCategory: product.categoryRaw as string,
-          marketplace: mp,
-          status: 'PENDING' as const,
-          aiSuggested: false,
-          allSuggestions: [],
-        }))
-      )
-
-    if (data.length === 0) {
-      res.json({ success: true, data: { created: 0, categories: 0, targetMappings: 0 } })
-      return
-    }
-
-    const result = await prisma.categoryMapping.createMany({
-      data,
-      skipDuplicates: true,
-    })
+    const createdResult = await createCategoryMappingRecords(marketplaces, sourceId || undefined)
     const suggestionResult = await refreshPendingSuggestions(marketplaces, sourceId || undefined)
 
     res.status(201).json({
       success: true,
       data: {
-        created: result.count,
-        categories: products.length,
-        targetMappings: data.length,
+        ...createdResult,
         suggestionsUpdated: suggestionResult.updated,
         suggestionsScanned: suggestionResult.scanned,
       },
@@ -531,7 +754,7 @@ export async function generateCategoryMappings(req: Request, res: Response) {
 export async function syncMarketplaceCategories(req: Request, res: Response) {
   try {
     const marketplace = String(req.params.marketplace || '').toUpperCase() as Marketplace
-    if (!MARKETPLACES.includes(marketplace) || marketplace === 'HEPSIBURADA') {
+    if (!MARKETPLACES.includes(marketplace)) {
       res.status(400).json({ success: false, error: 'Kategori agaci senkronizasyonu bu pazaryeri icin devre disi' })
       return
     }
@@ -587,9 +810,14 @@ export async function suggestCategoryMappings(req: Request, res: Response) {
     const marketplace = String(req.body?.marketplace || req.query.marketplace || '') as Marketplace
     const sourceId = String(req.body?.sourceId || req.query.sourceId || '')
     const marketplaces = marketplace ? [marketplace] : MARKETPLACES
-    const result = await refreshPendingSuggestions(marketplaces, sourceId || undefined)
+    let createdResult = { created: 0, categories: 0, targetMappings: 0 }
+    let result = await refreshPendingSuggestions(marketplaces, sourceId || undefined)
+    if (result.scanned === 0) {
+      createdResult = await createCategoryMappingRecords(marketplaces, sourceId || undefined)
+      result = await refreshPendingSuggestions(marketplaces, sourceId || undefined)
+    }
 
-    res.json({ success: true, data: result })
+    res.json({ success: true, data: { ...result, ...createdResult } })
   } catch (e) {
     res.status(500).json({ success: false, error: 'Kategori onerileri olusturulamadi' })
   }
@@ -786,10 +1014,22 @@ export async function getMappingDefaultAttributes(req: Request, res: Response) {
       where: {
         marketplace: mapping.marketplace,
         categoryId: mapping.marketplaceCategoryId,
-        isMandatory: true,
       },
       orderBy: [{ displayOrder: 'asc' }, { attributeName: 'asc' }],
     })
+
+    const defaultRules = await prisma.attributeRule.findMany({
+      where: {
+        marketplace: mapping.marketplace,
+        sourceId: mapping.sourceId,
+        sourceCategory: mapping.sourceCategory,
+        marketplaceCategoryId: mapping.marketplaceCategoryId,
+        matchType: 'ALWAYS',
+        isActive: true,
+      },
+      orderBy: [{ priority: 'desc' }, { updatedAt: 'desc' }],
+    })
+    const ruleByAttributeId = new Map(defaultRules.map(rule => [rule.attributeId, rule]))
 
     const products = await prisma.product.findMany({
       where: {
@@ -810,6 +1050,7 @@ export async function getMappingDefaultAttributes(req: Request, res: Response) {
       : []
 
     const attrs = attrDefs.map(def => {
+      const defaultRule = ruleByAttributeId.get(def.attributeId)
       const counts = new Map<string, number>()
       for (const attr of existing.filter(item => item.attributeId === def.attributeId)) {
         const key = attributeValueKey(attr)
@@ -825,9 +1066,18 @@ export async function getMappingDefaultAttributes(req: Request, res: Response) {
         isMandatory: def.isMandatory,
         allowCustomValue: def.allowCustomValue,
         values: def.values ?? [],
-        currentValue: current.valueId ?? current.valueText,
-        currentValueType: current.valueId ? 'valueId' : current.valueText ? 'valueText' : null,
+        currentValue: defaultRule?.valueId ?? defaultRule?.valueText ?? current.valueId ?? current.valueText,
+        currentValueType: defaultRule?.valueId
+          ? 'valueId'
+          : defaultRule?.valueText
+            ? 'valueText'
+            : current.valueId
+              ? 'valueId'
+              : current.valueText
+                ? 'valueText'
+                : null,
         valueCount,
+        ruleId: defaultRule?.id ?? null,
       }
     })
 
@@ -842,11 +1092,13 @@ export async function getMappingDefaultAttributes(req: Request, res: Response) {
   }
 }
 
-export async function saveMappingDefaultAttributes(req: Request, res: Response) {
+export async function saveMappingDefaultAttributes(req: AuthRequest, res: Response) {
   try {
-    const { attributes, overwrite = false } = req.body as {
+    const { attributes, overwrite = false, saveAsRules = true, applyNow = true } = req.body as {
       attributes: AttributePayload[]
       overwrite?: boolean
+      saveAsRules?: boolean
+      applyNow?: boolean
     }
     if (!Array.isArray(attributes)) {
       res.status(400).json({ success: false, error: 'attributes dizisi zorunlu' })
@@ -913,7 +1165,53 @@ export async function saveMappingDefaultAttributes(req: Request, res: Response) 
 
     let applied = 0
     let skipped = 0
-    for (const product of products) {
+    let rulesSaved = 0
+
+    if (saveAsRules) {
+      for (const attr of attributes) {
+        const def = attrDefs.find(item => item.attributeId === attr.attributeId)
+        if (!def) continue
+        const existingRule = await prisma.attributeRule.findFirst({
+          where: {
+            marketplace: mapping.marketplace,
+            sourceId: mapping.sourceId,
+            sourceCategory: mapping.sourceCategory,
+            marketplaceCategoryId: mapping.marketplaceCategoryId,
+            attributeId: attr.attributeId,
+            matchType: 'ALWAYS',
+          },
+          orderBy: { updatedAt: 'desc' },
+        })
+        const ruleData = {
+          name: `${mapping.sourceCategory} - ${def.attributeName}`,
+          attributeName: def.attributeName,
+          valueId: attr.valueId ?? null,
+          valueText: attr.valueText ?? null,
+          confidence: 1,
+          priority: 100,
+          isActive: true,
+          createdBy: req.user?.email ?? req.user?.id ?? 'admin',
+        }
+        if (existingRule) {
+          await prisma.attributeRule.update({ where: { id: existingRule.id }, data: ruleData })
+        } else {
+          await prisma.attributeRule.create({
+            data: {
+              marketplace: mapping.marketplace,
+              sourceId: mapping.sourceId,
+              sourceCategory: mapping.sourceCategory,
+              marketplaceCategoryId: mapping.marketplaceCategoryId,
+              attributeId: attr.attributeId,
+              matchType: 'ALWAYS',
+              ...ruleData,
+            },
+          })
+        }
+        rulesSaved += 1
+      }
+    }
+
+    for (const product of applyNow ? products : []) {
       for (const attr of attributes) {
         const def = attrDefs.find(item => item.attributeId === attr.attributeId)
         if (!def) continue
@@ -978,6 +1276,7 @@ export async function saveMappingDefaultAttributes(req: Request, res: Response) 
       productCount: products.length,
       applied,
       skipped,
+      rulesSaved,
     })
   } catch (e) {
     res.status(500).json({ success: false, error: 'Kategori varsayilan ozellikleri kaydedilemedi' })

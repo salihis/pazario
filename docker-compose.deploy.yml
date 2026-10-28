@@ -57,16 +57,26 @@ services:
         required: false
     environment:
       NODE_ENV: production
+      HB_ENVIRONMENT: production
+      HB_USER_AGENT: gulkirtasiye_dev
       PORT: 3000
       DATABASE_URL: postgresql://${DB_USER:-pazario}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-pazario_db}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public_key
+      JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_private_key
       XML_IMPORT_DIR: /app/imports
+      INVOICE_STORAGE_DIR: /app/invoices
+      PRODUCT_MEDIA_DIR: /app/media
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://pazario.tr}
+      NODE_OPTIONS: ${BACKEND_NODE_OPTIONS:---max-old-space-size=768}
     command: sh -c "npx prisma migrate deploy && npx tsx src/index.ts"
     volumes:
       - ./logs:/app/logs
       - ./imports:/app/imports:ro
+      - ./invoices:/app/invoices
+      - ./media:/app/media
       - ./public.pem:/run/secrets/jwt_public_key:ro
+      - ./private.pem:/run/secrets/jwt_private_key:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -99,9 +109,12 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx.deploy.conf:/etc/nginx/nginx.conf:ro
       - ./logs/nginx:/var/log/nginx
+      - ./certbot/www:/var/www/certbot:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
     depends_on:
       - admin
       - backend

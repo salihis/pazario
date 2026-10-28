@@ -29,6 +29,10 @@ export interface PipelineResult {
 const MARKETPLACES: Marketplace[] = ['TRENDYOL', 'N11', 'PAZARAMA']
 const PUBLISH_BATCH_SIZE = 100
 const AUTO_PUBLISH_ON_SYNC = process.env.AUTO_PUBLISH_ON_SYNC === 'true'
+const FALLBACK_MAX_AGE_HOURS = Math.max(
+  1,
+  Number.parseInt(process.env.XML_FALLBACK_MAX_AGE_HOURS || '24', 10) || 24,
+)
 
 function parseCategoryIncludeKeywords(value: string | null | undefined): string[] {
   return (value ?? '')
@@ -113,7 +117,9 @@ export class MarketplacePipeline {
           { err: error, sourceId: source.id, sourceName: source.name, fallbackUrl: source.fallbackUrl },
           'XML ana URL okunamadi, yedek kaynak deneniyor'
         )
-        xmlContent = await fetchXml(source.fallbackUrl, source.fetchTimeoutSec * 1000)
+        xmlContent = await fetchXml(source.fallbackUrl, source.fetchTimeoutSec * 1000, {
+          maxFileAgeMs: FALLBACK_MAX_AGE_HOURS * 3_600_000,
+        })
       }
 
       // â”€â”€ 3. Parse et â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

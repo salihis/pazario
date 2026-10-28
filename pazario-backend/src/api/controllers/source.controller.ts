@@ -7,6 +7,7 @@ import { XMLParser, buildParseOptionsForSource } from '../../parser/XMLParser'
 import { logger } from '../../utils/logger'
 import { fetchXml } from '../../utils/xmlFetch'
 import { MIN_MARKETPLACE_STOCK } from '../../validators/ProductValidator'
+import { purchaseCostSettingsFromBody } from '../../services/PurchaseCostService'
 
 const prisma = new PrismaClient()
 const parser = new XMLParser()
@@ -81,7 +82,8 @@ export async function getSources(req: Request, res: Response) {
     })
     res.json({ success: true, data })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatasi' })
+    logger.error({ err: e }, 'XML kaynaklari listelenemedi')
+    res.status(500).json({ success: false, error: e instanceof Error ? e.message : 'Sunucu hatasi' })
   }
 }
 
@@ -99,6 +101,7 @@ export async function createSource(req: Request, res: Response) {
         fallbackUrl: typeof fallbackUrl === 'string' && fallbackUrl.trim() ? fallbackUrl.trim() : null,
         fetchTimeoutSec: normalizeFetchTimeoutSec(fetchTimeoutSec),
         categoryIncludeKeywords: normalizeCategoryIncludeKeywords(categoryIncludeKeywords),
+        ...purchaseCostSettingsFromBody(req.body),
         autoSyncEnabled: autoSyncEnabled !== false,
         autoSyncTime: normalizeAutoSyncTime(autoSyncTime),
         active: true,
@@ -106,7 +109,8 @@ export async function createSource(req: Request, res: Response) {
     })
     res.status(201).json({ success: true, data: source })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Kaynak olusturulamadi' })
+    logger.error({ err: e }, 'XML kaynak olusturulamadi')
+    res.status(500).json({ success: false, error: e instanceof Error ? e.message : 'Kaynak olusturulamadi' })
   }
 }
 
@@ -121,6 +125,9 @@ export async function updateSource(req: Request, res: Response) {
       active?: boolean
       autoSyncEnabled?: boolean
       autoSyncTime?: string
+      priceIncludesVat?: boolean
+      purchaseVatRate?: number
+      purchaseExtraFee?: number
     } = {}
 
     if (typeof req.body.name === 'string' && req.body.name.trim()) data.name = req.body.name.trim()
@@ -131,6 +138,7 @@ export async function updateSource(req: Request, res: Response) {
     if (typeof req.body.active === 'boolean') data.active = req.body.active
     if (typeof req.body.autoSyncEnabled === 'boolean') data.autoSyncEnabled = req.body.autoSyncEnabled
     if (req.body.autoSyncTime !== undefined) data.autoSyncTime = normalizeAutoSyncTime(req.body.autoSyncTime)
+    Object.assign(data, purchaseCostSettingsFromBody(req.body))
 
     const source = await prisma.xmlSource.update({
       where: { id: req.params.id },
@@ -144,13 +152,56 @@ export async function updateSource(req: Request, res: Response) {
 
 export async function deleteSource(req: Request, res: Response) {
   try {
-    await prisma.xmlSource.update({
+    const source = await prisma.xmlSource.findUnique({
       where: { id: req.params.id },
-      data: { active: false },
+      select: {
+        id: true,
+        _count: {
+          select: {
+            products: true,
+            orderItems: true,
+          },
+        },
+      },
     })
+
+    if (!source) {
+      res.status(404).json({ success: false, error: 'Kaynak bulunamadi' })
+      return
+    }
+
+    if (source._count.products > 0 || source._count.orderItems > 0) {
+      res.status(409).json({
+        success: false,
+        error: `Bu kaynakta ${source._count.products} urun ve ${source._count.orderItems} siparis kalemi var. Veri kaybini onlemek icin once pasife alinabilir, tamamen silinemez.`,
+      })
+      return
+    }
+
+    await prisma.$transaction(async tx => {
+      const syncJobs = await tx.syncJob.findMany({
+        where: { sourceId: source.id },
+        select: { id: true },
+      })
+      const syncJobIds = syncJobs.map(job => job.id)
+
+      if (syncJobIds.length > 0) {
+        await tx.marketplaceListing.updateMany({
+          where: { lastSyncJobId: { in: syncJobIds } },
+          data: { lastSyncJobId: null },
+        })
+        await tx.priceCalculation.deleteMany({ where: { syncJobId: { in: syncJobIds } } })
+        await tx.publishError.deleteMany({ where: { jobId: { in: syncJobIds } } })
+        await tx.syncJob.deleteMany({ where: { id: { in: syncJobIds } } })
+      }
+
+      await tx.categoryMapping.deleteMany({ where: { sourceId: source.id } })
+      await tx.xmlSource.delete({ where: { id: source.id } })
+    })
+
     res.json({ success: true })
   } catch (e) {
-    res.status(404).json({ success: false, error: 'Kaynak bulunamadi' })
+    res.status(500).json({ success: false, error: e instanceof Error ? e.message : 'Kaynak silinemedi' })
   }
 }
 
@@ -216,6 +267,10 @@ export async function testSource(req: Request, res: Response) {
 
     if (!normalized || normalized.length === 0) {
       throw new Error('Feed bos dondu')
+    }
+
+    if (/Just a moment|cf-browser-verification|cloudflare/i.test(normalized)) {
+      throw new Error('XML linki Cloudflare/bot korumasi nedeniyle backend sunucusundan okunamiyor. Tedarikciden sunucu IP adresini izin listesine eklemesini isteyin veya yedek XML dosyasi/URL kullanin.')
     }
 
     if (/^(error|failed|unauthorized)/i.test(normalized) || /^<html/i.test(normalized)) {
@@ -296,9 +351,15 @@ export async function testSource(req: Request, res: Response) {
     })
   } catch (e) {
     const err = e as { message?: string; code?: string }
+    const status = (e as { response?: { status?: number; data?: unknown } }).response?.status
+    const data = (e as { response?: { data?: unknown } }).response?.data
+    const htmlText = Buffer.isBuffer(data) ? data.toString('utf8', 0, 500) : typeof data === 'string' ? data.slice(0, 500) : ''
+    const cloudflareBlocked = status === 403 && /Just a moment|cf-browser-verification|cloudflare/i.test(htmlText)
     res.status(400).json({
       success: false,
-      error: err.message ?? 'Feed test edilemedi',
+      error: cloudflareBlocked
+        ? 'XML linki Cloudflare/bot korumasi nedeniyle backend sunucusundan okunamiyor. Tedarikciden sunucu IP adresini izin listesine eklemesini isteyin veya yedek XML dosyasi/URL kullanin.'
+        : err.message ?? 'Feed test edilemedi',
     })
   }
 }
@@ -323,7 +384,8 @@ export async function syncSource(req: Request, res: Response) {
 
     res.status(202).json({ success: true, data: { syncJobId: syncJob.id } })
   } catch (e) {
-    res.status(500).json({ success: false, error: 'Sunucu hatasi' })
+    logger.error({ err: e, sourceId: req.params.id }, 'XML kaynak senkronizasyonu baslatilamadi')
+    res.status(500).json({ success: false, error: e instanceof Error ? e.message : 'Sunucu hatasi' })
   }
 }
 

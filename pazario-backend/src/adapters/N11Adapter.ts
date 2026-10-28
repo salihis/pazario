@@ -41,7 +41,9 @@ function extractAxiosMessage(error: unknown): string {
   if (error instanceof Error) {
     const axiosErr = error as Error & { response?: { data?: unknown } }
     const data = axiosErr.response?.data
-    return typeof data === 'string' ? data : data ? JSON.stringify(data) : error.message
+    const status = axiosErr.response && 'status' in axiosErr.response ? `HTTP ${axiosErr.response.status}` : ''
+    const detail = typeof data === 'string' ? data : data ? JSON.stringify(data) : error.message
+    return [status, detail].filter(Boolean).join(' - ')
   }
   return String(error)
 }
@@ -159,11 +161,12 @@ export class N11Adapter extends BaseAdapter {
           message: `N11 product-create task olusturuldu: ${taskId}`,
         }
       } catch (error: unknown) {
+        const detail = extractAxiosMessage(error)
         return {
           success: false,
           productId: product.id,
           message: 'N11 urun gonderimi basarisiz',
-          errors: [extractAxiosMessage(error)],
+          errors: [`${stockCode}: ${detail}`],
         }
       }
     }, 1)

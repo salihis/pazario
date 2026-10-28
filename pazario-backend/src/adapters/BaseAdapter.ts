@@ -13,8 +13,10 @@ export interface Product {
   barcode?: string
   productMainId?: string
   images: string[]
+  videos?: string[]
   category?: string
   brand?: string
+  marketplaceBrand?: string
 }
 
 export interface PublishResult {

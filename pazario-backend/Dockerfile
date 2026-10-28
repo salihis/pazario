@@ -33,7 +33,7 @@ WORKDIR /app
 
 # Install curl for health checks and OpenSSL for Prisma engines
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl openssl ca-certificates \
+  && apt-get install -y --no-install-recommends curl openssl ca-certificates fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/*
 
 # Copy package files for dependencies

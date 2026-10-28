@@ -6,6 +6,9 @@ import pino from 'pino'
 
 const prisma = new PrismaClient()
 const logger = pino({ level: 'info' })
+const adminEmail = process.env.ADMIN_EMAIL || process.env.ADMIN_USERNAME
+const adminName = process.env.ADMIN_NAME || 'Super Admin'
+const adminPassword = process.env.ADMIN_PASSWORD
 
 async function main() {
   logger.info('Seed başlatılıyor...')
@@ -71,13 +74,18 @@ async function main() {
 
   // ─── 3. Super Admin Kullanıcı ─────────────────────────────────────────────
   try {
-    const passwordHash = await bcrypt.hash('Admin123!@#', 12)
+    if (!adminEmail || !adminPassword) {
+      throw new Error('ADMIN_EMAIL/ADMIN_USERNAME ve ADMIN_PASSWORD zorunlu')
+    }
+
+    const normalizedAdminEmail = adminEmail.toLowerCase()
+    const passwordHash = await bcrypt.hash(adminPassword, 12)
     await prisma.user.upsert({
-      where: { email: 'admin@example.com' },
+      where: { email: normalizedAdminEmail },
       update: {},
       create: {
-        email: 'admin@example.com',
-        name: 'Super Admin',
+        email: normalizedAdminEmail,
+        name: adminName,
         passwordHash,
         role: 'SUPER_ADMIN',
       },

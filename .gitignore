@@ -80,6 +80,14 @@ docker-compose.override.yml
 tmp/
 temp/
 .cache/
+invoices/
+__pycache__/
+*.pyc
+*.tar.gz
+*.bak
+*.bak.*
+*.backup_*
+*.pre-*
 .turbo/
 .next/
 .nuxt/

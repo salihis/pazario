@@ -2,7 +2,7 @@ import axios from 'axios'
 import http from 'http'
 import https from 'https'
 import path from 'path'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import { fileURLToPath } from 'url'
 import { TextDecoder } from 'node:util'
 
@@ -97,7 +97,30 @@ export function decodeXmlBuffer(input: ArrayBuffer | Buffer, contentType?: strin
   return bestText || buffer.toString('utf8')
 }
 
-export async function fetchXml(url: string, timeoutMs = 30000): Promise<string> {
+function assertXmlLikeResponse(text: string, contentType?: string): void {
+  const normalized = text.trim()
+  if (!normalized) {
+    throw new Error('XML feed bos dondu')
+  }
+
+  const looksLikeHtml = /^<!doctype\s+html/i.test(normalized)
+    || /^<html[\s>]/i.test(normalized)
+  const isHtmlContentType = /text\/html/i.test(contentType ?? '')
+
+  if (looksLikeHtml || isHtmlContentType && !/^<\?xml|^<rss[\s>]|^<feed[\s>]|^<products[\s>]|^<catalog[\s>]|^<items[\s>]|^<Urunler[\s>]|^<Root[\s>]/i.test(normalized)) {
+    const title = normalized.match(/<title[^>]*>(.*?)<\/title>/is)?.[1]?.replace(/\s+/g, ' ').trim()
+    const message = title
+      ? `XML yerine HTML sayfasi dondu: ${title}`
+      : `XML yerine HTML sayfasi dondu: ${normalized.slice(0, 180).replace(/\s+/g, ' ')}`
+    throw new Error(message)
+  }
+}
+
+export async function fetchXml(
+  url: string,
+  timeoutMs = 30000,
+  options: { maxFileAgeMs?: number } = {}
+): Promise<string> {
   if (url.startsWith('data:text/xml;base64,')) {
     return Buffer.from(url.replace('data:text/xml;base64,', ''), 'base64').toString('utf8')
   }
@@ -109,10 +132,23 @@ export async function fetchXml(url: string, timeoutMs = 30000): Promise<string> 
     if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
       throw new Error(`XML dosyasi izin verilen klasor disinda: ${filePath}`)
     }
+    if (options.maxFileAgeMs && options.maxFileAgeMs > 0) {
+      const fileStats = await stat(filePath)
+      const ageMs = Date.now() - fileStats.mtimeMs
+      if (ageMs > options.maxFileAgeMs) {
+        const ageHours = Math.floor(ageMs / 3_600_000)
+        throw new Error(`Yedek XML dosyasi güncel degil: ${ageHours} saattir yenilenmedi`)
+      }
+    }
     const buffer = await readFile(filePath)
-    return decodeXmlBuffer(buffer)
+    const xml = decodeXmlBuffer(buffer)
+    assertXmlLikeResponse(xml)
+    return xml
   }
 
   const response = await xmlHttpClient.get<ArrayBuffer>(url, { timeout: timeoutMs })
-  return decodeXmlBuffer(response.data, response.headers['content-type'])
+  const contentType = response.headers['content-type']
+  const xml = decodeXmlBuffer(response.data, contentType)
+  assertXmlLikeResponse(xml, contentType)
+  return xml
 }

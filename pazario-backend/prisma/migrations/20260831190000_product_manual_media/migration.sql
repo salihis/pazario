@@ -1,0 +1,2 @@
+ALTER TABLE "products" ADD COLUMN "manualMedia" JSONB,
+ADD COLUMN "mediaVersion" INTEGER NOT NULL DEFAULT 0;

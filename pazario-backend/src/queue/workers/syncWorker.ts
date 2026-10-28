@@ -1,19 +1,19 @@
-// src/queue/workers/syncWorker.ts
-
 import { Worker } from 'bullmq'
 import { PrismaClient } from '@prisma/client'
 import { redis } from '../../utils/redis'
-import { publishQueue, notifyQueue, syncQueue } from '../queues'
+import { notifyQueue, syncQueue } from '../queues'
 import type { SyncJobData } from '../jobs'
+import { OperationHistoryService } from '../../services/OperationHistoryService'
 
 const prisma = new PrismaClient()
-const PUBLISH_BATCH_SIZE = 100
+const operationService = new OperationHistoryService(prisma)
 
 export const syncWorker = new Worker<SyncJobData>(
   'sync',
   async (job) => {
     const { sourceId, triggeredBy } = job.data
     const startedAt = new Date()
+    let operationId = job.data.operationId
 
     if (sourceId === 'all') {
       const sources = await prisma.xmlSource.findMany({
@@ -22,9 +22,27 @@ export const syncWorker = new Worker<SyncJobData>(
       })
 
       for (const source of sources) {
-        await syncQueue.add('sync', {
+        const operation = await operationService.createOperation({
+          type: 'XML_SYNC',
+          title: 'XML senkronizasyonu',
+          queueName: 'sync',
+          requestedBy: triggeredBy,
+          sourceId: source.id,
+          targetCount: 1,
+          retryPayload: {
+            queueName: 'sync',
+            jobName: 'sync',
+            data: { sourceId: source.id, triggeredBy },
+          },
+        })
+        const queuedJob = await syncQueue.add('sync', {
           sourceId: source.id,
           triggeredBy,
+          operationId: operation.id,
+        })
+        await prisma.operationHistory.update({
+          where: { id: operation.id },
+          data: { queueJobId: String(queuedJob.id) },
         })
       }
 
@@ -32,7 +50,25 @@ export const syncWorker = new Worker<SyncJobData>(
       return { enqueued: sources.length }
     }
 
-    // sync_jobs kaydını RUNNING yap
+    if (!operationId) {
+      const operation = await operationService.createOperation({
+        type: 'XML_SYNC',
+        title: 'XML senkronizasyonu',
+        queueName: 'sync',
+        queueJobId: String(job.id ?? ''),
+        requestedBy: triggeredBy,
+        sourceId,
+        targetCount: 1,
+        retryPayload: {
+          queueName: 'sync',
+          jobName: job.name || 'sync',
+          data: { sourceId, triggeredBy },
+        },
+      })
+      operationId = operation.id
+    }
+    await operationService.markRunning(operationId, { queueJobId: job.id })
+
     const syncJob = await prisma.syncJob.create({
       data: {
         sourceId,
@@ -40,24 +76,25 @@ export const syncWorker = new Worker<SyncJobData>(
         startedAt,
       },
     })
+    await prisma.operationHistory.update({
+      where: { id: operationId },
+      data: { syncJobId: syncJob.id },
+    })
 
     try {
-      // XML kaynağını çek
       const source = await prisma.xmlSource.findUnique({ where: { id: sourceId } })
       if (!source || !source.active) {
-        throw new Error(`XML kaynağı bulunamadı veya pasif: ${sourceId}`)
+        throw new Error(`XML kaynagi bulunamadi veya pasif: ${sourceId}`)
       }
 
       await job.updateProgress(10)
 
-      // Pipeline çalıştır
       const { MarketplacePipeline } = await import('../../MarketplacePipeline')
       const pipeline = new MarketplacePipeline(prisma)
       const result = await pipeline.run(syncJob.id)
 
       await job.updateProgress(100)
 
-      // sync_jobs DONE
       await prisma.syncJob.update({
         where: { id: syncJob.id },
         data: {
@@ -70,7 +107,6 @@ export const syncWorker = new Worker<SyncJobData>(
         },
       })
 
-      // Hata oranı %20 üstü → Slack bildirimi
       const errorRate = result.totalFetched > 0
         ? result.failed / result.totalFetched
         : 0
@@ -78,27 +114,47 @@ export const syncWorker = new Worker<SyncJobData>(
       if (errorRate > 0.2) {
         await notifyQueue.add('sync-error-rate', {
           type: 'slack',
-          message: `⚠️ Sync hata oranı yüksek: %${Math.round(errorRate * 100)} (${result.failed}/${result.totalFetched})`,
+          message: `Sync hata orani yuksek: %${Math.round(errorRate * 100)} (${result.failed}/${result.totalFetched})`,
           level: 'warn',
         })
       }
 
+      const status = result.failed > 0
+        ? result.published > 0 || result.changedProducts > 0
+          ? 'PARTIALLY_FAILED'
+          : 'FAILED'
+        : 'SUCCEEDED'
+
+      await operationService.markFinished(operationId, status, {
+        successCount: result.published,
+        failedCount: result.failed,
+        metadata: {
+          totalFetched: result.totalFetched,
+          changedProducts: result.changedProducts,
+        },
+      })
+
       return result
     } catch (e) {
-      // sync_jobs FAILED
+      const message = e instanceof Error ? e.message : String(e)
       await prisma.syncJob.update({
         where: { id: syncJob.id },
         data: {
           status: 'FAILED',
           finishedAt: new Date(),
-          errorMessage: e instanceof Error ? e.message : String(e),
+          errorMessage: message,
         },
       })
 
       await notifyQueue.add('sync-failed', {
         type: 'slack',
-        message: `❌ Sync başarısız: ${sourceId} — ${e instanceof Error ? e.message : String(e)}`,
+        message: `Sync basarisiz: ${sourceId} - ${message}`,
         level: 'error',
+      })
+
+      await operationService.markFinished(operationId, 'FAILED', {
+        errorMessage: message,
+        failedCount: 1,
       })
 
       throw e
@@ -109,10 +165,10 @@ export const syncWorker = new Worker<SyncJobData>(
     lockDuration: 10 * 60 * 1000,
     stalledInterval: 60 * 1000,
     maxStalledCount: 2,
-    concurrency: 1, // aynı anda sadece bir sync
+    concurrency: 1,
   }
 )
 
 syncWorker.on('failed', (job, err) => {
-  process.stderr.write(`Sync job başarısız: ${job?.id} — ${err.message}\n`)
+  process.stderr.write(`Sync job basarisiz: ${job?.id} - ${err.message}\n`)
 })

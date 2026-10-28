@@ -1,17 +1,17 @@
 // src/api/controllers/order.controller.ts
 
 import { Request, Response } from 'express'
-import { PrismaClient } from '@prisma/client'
+import { Marketplace, Prisma, PrismaClient } from '@prisma/client'
 import { OrderStateMachine } from '../../services/OrderStateMachine'
 import { OrderFetchService } from '../../services/OrderFetchService'
 import { EmailService } from '../../services/EmailService'
 import { logger } from '../../utils/logger'
+import { ORDER_TAB_STATUSES, orderTabWhere } from '../../services/OrderViewService'
 
 const prisma = new PrismaClient()
 const stateMachine = new OrderStateMachine(prisma)
 const fetchService = new OrderFetchService(prisma)
 const emailService = new EmailService()
-
 function maskPhone(phone: string | null): string | null {
   if (!phone) return null
   const digits = phone.replace(/\D/g, '')
@@ -44,13 +44,19 @@ export async function getOrders(req: Request, res: Response) {
     const page = parseInt(String(req.query.page || '1'))
     const limit = parseInt(String(req.query.limit || '25'))
     const skip = (page - 1) * limit
-    const where: Record<string, unknown> = {}
-    if (req.query.status) where.status = req.query.status
-    if (req.query.marketplace) where.marketplace = req.query.marketplace
+    const where: Prisma.OrderWhereInput = req.query.status
+      ? orderTabWhere(String(req.query.status))
+      : {}
+    if (req.query.marketplace) where.marketplace = String(req.query.marketplace) as Marketplace
     if (req.query.search) {
-      where.OR = [
-        { marketplaceOrderId: { contains: String(req.query.search) } },
-        { marketplaceOrderNo: { contains: String(req.query.search) } },
+      where.AND = [
+        ...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []),
+        {
+          OR: [
+            { marketplaceOrderId: { contains: String(req.query.search) } },
+            { marketplaceOrderNo: { contains: String(req.query.search) } },
+          ],
+        },
       ]
     }
     const [orders, total] = await Promise.all([
@@ -59,7 +65,7 @@ export async function getOrders(req: Request, res: Response) {
         skip,
         take: limit,
         orderBy: { createdAt: 'desc' },
-        include: { items: { include: { source: { select: { id: true, name: true } } } } },
+        include: { items: { include: { source: { select: { id: true, name: true } } } }, invoice: true },
       }),
       prisma.order.count({ where }),
     ])
@@ -187,18 +193,23 @@ export async function fetchOrders(req: Request, res: Response) {
 
 export async function getOrderStats(req: Request, res: Response) {
   try {
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-    const [todayNew, pendingApproval, pendingReturn, total, byStatusRows, byMarketplaceRows, lastFetchLogs] = await Promise.all([
-      prisma.order.count({ where: { status: 'NEW', createdAt: { gte: today } } }),
+    const marketplace = req.query.marketplace ? String(req.query.marketplace) : undefined
+    const marketplaceWhere: Prisma.OrderWhereInput = marketplace
+      ? { marketplace: marketplace as Marketplace }
+      : {}
+    const tabEntries = Object.keys(ORDER_TAB_STATUSES)
+    const [tabCounts, todayNew, pendingApproval, pendingReturn, total, byMarketplaceRows, lastFetchLogs] = await Promise.all([
+      Promise.all(tabEntries.map(status => prisma.order.count({
+        where: { AND: [marketplaceWhere, orderTabWhere(status)] },
+      }))),
+      prisma.order.count({ where: { AND: [marketplaceWhere, orderTabWhere('NEW')] } }),
       prisma.order.count({ where: { status: 'PENDING_APPROVAL' } }),
       prisma.order.count({ where: { status: 'RETURN_REQUESTED' } }),
-      prisma.order.count(),
-      prisma.order.groupBy({ by: ['status'], _count: { _all: true } }),
+      prisma.order.count({ where: marketplaceWhere }),
       prisma.order.groupBy({ by: ['marketplace'], _count: { _all: true } }),
       prisma.orderFetchLog.findMany({ orderBy: { createdAt: 'desc' }, take: 12 }),
     ])
-    const byStatus = Object.fromEntries(byStatusRows.map(row => [row.status, row._count._all]))
+    const byStatus = Object.fromEntries(tabEntries.map((status, index) => [status, tabCounts[index]]))
     const byMarketplace = Object.fromEntries(byMarketplaceRows.map(row => [row.marketplace, row._count._all]))
     res.json({ success: true, data: { todayNew, pendingApproval, pendingReturn, total, byStatus, byMarketplace, lastFetchLogs } })
   } catch (e) {

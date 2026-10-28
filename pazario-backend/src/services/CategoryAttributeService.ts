@@ -1,8 +1,12 @@
 ﻿// src/services/CategoryAttributeService.ts
 
 import { PrismaClient } from '@prisma/client'
+import { effectiveProductMedia } from './ProductMediaService'
 import { logger } from '../utils/logger'
 import { applyXmlColorSizeOverrides } from './XmlAttributeOverrideService'
+import { decryptJson } from './FieldEncryptionService'
+import { hepsiburadaAuthHeaders, hepsiburadaProductApiUrl } from '../config/hepsiburada'
+import { MARKETPLACE_BRAND_NAME, marketplaceBarcode } from './MarketplacePayloadTransform'
 
 // â”€â”€â”€ INTERFACE'LER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -26,6 +30,7 @@ export interface FormField extends Attribute {
   currentValue: string | string[] | boolean | null
   isValid: boolean
   validationError: string | null
+  systemManaged: boolean
 }
 
 export interface ValidationResult {
@@ -38,8 +43,25 @@ export interface ValidationResult {
 const CACHE_TTL_DAYS = 7
 const CACHE_TTL_MS = CACHE_TTL_DAYS * 24 * 60 * 60 * 1000
 
+const HEPSIBURADA_SYSTEM_ATTRIBUTE_IDS = new Set([
+  'merchantSku',
+  'UrunAdi',
+  'UrunAciklamasi',
+  'Barcode',
+  'Marka',
+  'tax_vat_rate',
+  'price',
+  'stock',
+  ...Array.from({ length: 10 }, (_, index) => `Image${index + 1}`),
+])
+
 type Marketplace = 'TRENDYOL' | 'HEPSIBURADA' | 'N11' | 'PAZARAMA'
 let pazaramaTokenCache: { token: string; expiresAt: number } | null = null
+const hepsiburadaValueRefreshAttempted = new Set<string>()
+
+function cleanCredential(value: unknown): string {
+  return String(value ?? '').trim()
+}
 
 function normalizeText(value: string): string {
   return value
@@ -93,6 +115,49 @@ function extractAttributeValues(item: any): { id: string; name: string }[] {
 export class CategoryAttributeService {
   constructor(private readonly prisma: PrismaClient) {}
 
+  private async activeMarketplaceCredentials(marketplace: Marketplace): Promise<Record<string, string>> {
+    const record = await this.prisma.marketplaceCredential.findUnique({ where: { marketplace } })
+    if (!record?.isActive) return {}
+    return decryptJson(record.credentialsEncrypted)
+  }
+
+  private async trendyolApiCredentials() {
+    const credentials = await this.activeMarketplaceCredentials('TRENDYOL')
+    return {
+      apiKey: cleanCredential(credentials.apiKey || process.env.TY_API_KEY),
+      apiSecret: cleanCredential(credentials.apiSecret || process.env.TY_API_SECRET),
+    }
+  }
+
+  private async n11ApiCredentials() {
+    const credentials = await this.activeMarketplaceCredentials('N11')
+    return {
+      appKey: cleanCredential(credentials.appKey || process.env.N11_APPKEY),
+      appSecret: cleanCredential(credentials.appSecret || process.env.N11_APPSECRET),
+    }
+  }
+
+  private async pazaramaApiCredentials() {
+    const credentials = await this.activeMarketplaceCredentials('PAZARAMA')
+    return {
+      clientId: cleanCredential(credentials.clientId || process.env.PZ_CLIENT_ID),
+      clientSecret: cleanCredential(credentials.clientSecret || process.env.PZ_CLIENT_SECRET),
+    }
+  }
+
+  private async hepsiburadaApiCredentials() {
+    const credentials = await this.activeMarketplaceCredentials('HEPSIBURADA')
+    const merchantId = cleanCredential(credentials.merchantId || process.env.HB_MERCHANT_ID)
+    const serviceKey = cleanCredential(credentials.serviceKey || process.env.HB_SERVICE_KEY)
+    return {
+      merchantId,
+      username: merchantId,
+      password: cleanCredential(serviceKey || credentials.password || process.env.HB_PASSWORD),
+      userAgent: cleanCredential(credentials.userAgent || credentials.developerUsername || process.env.HB_USER_AGENT || process.env.HB_DEVELOPER_USERNAME),
+      serviceKey,
+    }
+  }
+
   /**
    * Kategori Ã¶zelliklerini getirir
    * Stale-while-revalidate: 7 gÃ¼nden eski â†’ dÃ¶ndÃ¼r + arka planda refresh
@@ -102,12 +167,27 @@ export class CategoryAttributeService {
     categoryId: string,
     productId?: string
   ): Promise<{ attributes: FormField[]; source: 'cache' | 'api'; fetchedAt: Date }> {
-    const cached = await this.prisma.marketplaceCategoryAttribute.findMany({
+    let cached = await this.prisma.marketplaceCategoryAttribute.findMany({
       where: { marketplace, categoryId },
       orderBy: [{ isMandatory: 'desc' }, { displayOrder: 'asc' }],
     })
 
     if (cached.length > 0) {
+      const refreshKey = `${marketplace}:${categoryId}`
+      const hasEmptyHepsiburadaDropdowns = marketplace === 'HEPSIBURADA' && cached.some(attribute =>
+        attribute.attributeType === 'dropdown'
+        && (!Array.isArray(attribute.values) || attribute.values.length === 0)
+      )
+
+      if (hasEmptyHepsiburadaDropdowns && !hepsiburadaValueRefreshAttempted.has(refreshKey)) {
+        hepsiburadaValueRefreshAttempted.add(refreshKey)
+        await this.refreshFromAPI(marketplace, categoryId)
+        cached = await this.prisma.marketplaceCategoryAttribute.findMany({
+          where: { marketplace, categoryId },
+          orderBy: [{ isMandatory: 'desc' }, { displayOrder: 'asc' }],
+        })
+      }
+
       const fetchedAt = cached[0].fetchedAt
       const isStale = Date.now() - fetchedAt.getTime() > CACHE_TTL_MS
 
@@ -120,6 +200,7 @@ export class CategoryAttributeService {
 
       if (productId) {
         await this.syncXmlOverridesForProduct(productId, marketplace, categoryId)
+        await this.syncSystemManagedProductAttributes(productId, marketplace, cached.map(this.mapToAttribute))
       }
 
       const productAttrs = productId
@@ -128,7 +209,8 @@ export class CategoryAttributeService {
 
       const attributes = await this.buildFormSchema(
         cached.map(this.mapToAttribute),
-        productAttrs
+        productAttrs,
+        marketplace
       )
 
       return { attributes, source: 'cache', fetchedAt }
@@ -144,6 +226,7 @@ export class CategoryAttributeService {
 
     if (productId) {
       await this.syncXmlOverridesForProduct(productId, marketplace, categoryId)
+      await this.syncSystemManagedProductAttributes(productId, marketplace, fresh.map(this.mapToAttribute))
     }
 
     const productAttrs = productId
@@ -152,7 +235,8 @@ export class CategoryAttributeService {
 
     const attributes = await this.buildFormSchema(
       fresh.map(this.mapToAttribute),
-      productAttrs
+      productAttrs,
+      marketplace
     )
 
     return {
@@ -170,7 +254,9 @@ export class CategoryAttributeService {
       const attrs = await this.fetchFromMarketplaceAPI(marketplace, categoryId)
       const enrichedAttrs = marketplace === 'TRENDYOL'
         ? await this.enrichTrendyolAttributeValues(categoryId, attrs)
-        : attrs
+        : marketplace === 'HEPSIBURADA'
+          ? await this.enrichHepsiburadaAttributeValues(categoryId, attrs)
+          : attrs
 
       for (const attr of enrichedAttrs) {
         await this.prisma.marketplaceCategoryAttribute.upsert({
@@ -218,7 +304,8 @@ export class CategoryAttributeService {
    */
   async buildFormSchema(
     attributes: Attribute[],
-    productAttrs: Map<string, string>
+    productAttrs: Map<string, string>,
+    marketplace?: Marketplace
   ): Promise<FormField[]> {
     return attributes.map(attr => {
       const storedValue = productAttrs.get(attr.attributeId) ?? null
@@ -230,6 +317,7 @@ export class CategoryAttributeService {
         currentValue,
         isValid: validation.isValid,
         validationError: validation.error,
+        systemManaged: marketplace === 'HEPSIBURADA' && HEPSIBURADA_SYSTEM_ATTRIBUTE_IDS.has(attr.attributeId),
       }
     })
   }
@@ -349,7 +437,7 @@ export class CategoryAttributeService {
   ): Promise<Attribute[]> {
     const endpoints: Record<Marketplace, string> = {
       TRENDYOL: `https://apigw.trendyol.com/integration/product/product-categories/${categoryId}/attributes`,
-      HEPSIBURADA: `https://mpop.hepsiburada.com/product/api/categories/${categoryId}/attributes`,
+      HEPSIBURADA: hepsiburadaProductApiUrl(`/categories/${categoryId}/attributes`),
       N11: `https://api.n11.com/cdn/category/${categoryId}/attribute`,
       PAZARAMA: `https://isortagimapi.pazarama.com/category/getCategoryWithAttributes?Id=${encodeURIComponent(categoryId)}`,
     }
@@ -404,10 +492,77 @@ export class CategoryAttributeService {
     return results
   }
 
+  private async enrichHepsiburadaAttributeValues(categoryId: string, attributes: Attribute[]): Promise<Attribute[]> {
+    const headers = await this.buildHeaders('HEPSIBURADA')
+    const enumAttributes = attributes.filter(attr => attr.attributeType === 'dropdown')
+
+    const enriched = await Promise.all(enumAttributes.map(async attr => {
+      try {
+        const values: { id: string; name: string }[] = []
+        for (let page = 0; page < 10; page++) {
+          const url = hepsiburadaProductApiUrl(
+            `/categories/${encodeURIComponent(categoryId)}/attribute/${encodeURIComponent(attr.attributeId)}/values?version=5&page=${page}&size=1000`
+          )
+          const response = await fetch(url, { headers })
+          if (!response.ok) {
+            logger.warn(
+              { categoryId, attributeId: attr.attributeId, status: response.status },
+              'Hepsiburada ozellik degerleri alinamadi'
+            )
+            break
+          }
+
+          const payload = await response.json() as any
+          const rawValues = Array.isArray(payload?.data)
+            ? payload.data
+            : Array.isArray(payload?.data?.content)
+              ? payload.data.content
+              : Array.isArray(payload?.data?.items)
+                ? payload.data.items
+              : Array.isArray(payload?.content)
+                ? payload.content
+                : []
+          const pageValues = rawValues
+            .map((item: any) => ({
+              // Production currently omits id and returns only value.
+              id: String(item?.id ?? item?.value ?? ''),
+              name: String(item?.value ?? item?.name ?? ''),
+            }))
+            .filter((value: { id: string; name: string }) => value.id && value.name)
+
+          values.push(...pageValues)
+          const total = Number(
+            response.headers.get('total-count')
+            ?? response.headers.get('x-total-count')
+            ?? payload?.totalElements
+            ?? payload?.data?.totalElements
+            ?? NaN
+          )
+          const fetched = (page + 1) * 1000
+          if (pageValues.length < 1000 || (Number.isFinite(total) && fetched >= total)) break
+        }
+
+        if (values.length === 0) return attr
+        return {
+          ...attr,
+          attributeType: 'dropdown' as const,
+          // HB permits a custom string when the official enum has no suitable value.
+          allowCustomValue: true,
+          values: Array.from(new Map(values.map(value => [value.id, value])).values()),
+        }
+      } catch (err) {
+        logger.warn({ err, categoryId, attributeId: attr.attributeId }, 'Hepsiburada ozellik degeri yenileme hatasi')
+        return attr
+      }
+    }))
+
+    const byId = new Map(enriched.map(attr => [attr.attributeId, attr]))
+    return attributes.map(attr => byId.get(attr.attributeId) ?? attr)
+  }
+
   private async buildHeaders(marketplace: Marketplace): Promise<Record<string, string>> {
     if (marketplace === 'TRENDYOL') {
-      const apiKey = process.env.TY_API_KEY
-      const apiSecret = process.env.TY_API_SECRET
+      const { apiKey, apiSecret } = await this.trendyolApiCredentials()
       if (!apiKey || !apiSecret) return { 'User-Agent': 'PazarioIntegration' }
       return {
         Authorization: `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString('base64')}`,
@@ -416,14 +571,21 @@ export class CategoryAttributeService {
     }
 
     if (marketplace === 'N11') {
+      const { appKey, appSecret } = await this.n11ApiCredentials()
       return {
-        appkey: process.env.N11_APPKEY ?? '',
-        appsecret: process.env.N11_APPSECRET ?? '',
+        appkey: appKey,
+        appsecret: appSecret,
       }
     }
 
     if (marketplace === 'PAZARAMA') {
       return { Authorization: `Bearer ${await this.getPazaramaAccessToken()}` }
+    }
+
+    if (marketplace === 'HEPSIBURADA') {
+      const { merchantId, serviceKey, username, password, userAgent } = await this.hepsiburadaApiCredentials()
+      if (!merchantId || (!serviceKey && (!username || !password))) throw new Error('Hepsiburada API bilgileri eksik')
+      return hepsiburadaAuthHeaders(merchantId, serviceKey, username || merchantId, password || serviceKey, userAgent)
     }
 
     return {}
@@ -434,8 +596,7 @@ export class CategoryAttributeService {
       return pazaramaTokenCache.token
     }
 
-    const clientId = process.env.PZ_CLIENT_ID
-    const clientSecret = process.env.PZ_CLIENT_SECRET
+    const { clientId, clientSecret } = await this.pazaramaApiCredentials()
     if (!clientId || !clientSecret) throw new Error('Pazarama API bilgileri eksik')
 
     const response = await fetch('https://isortagimgiris.pazarama.com/connect/token', {
@@ -471,6 +632,77 @@ export class CategoryAttributeService {
     await applyXmlColorSizeOverrides(this.prisma, product, marketplace, categoryId)
   }
 
+  private async syncSystemManagedProductAttributes(
+    productId: string,
+    marketplace: Marketplace,
+    definitions: Attribute[]
+  ): Promise<void> {
+    if (marketplace !== 'HEPSIBURADA') return
+
+    const product = await this.prisma.product.findUnique({
+      where: { id: productId },
+      select: {
+        sku: true,
+        barcode: true,
+        title: true,
+        description: true,
+        brand: true,
+        price: true,
+        stock: true,
+        images: true,
+        manualMedia: true,
+        attributes: true,
+      },
+    })
+    if (!product) return
+
+    const xmlAttributes = product.attributes && typeof product.attributes === 'object' && !Array.isArray(product.attributes)
+      ? product.attributes as Record<string, unknown>
+      : {}
+    const firstText = (...values: unknown[]) => values
+      .map(value => String(value ?? '').trim())
+      .find(Boolean) ?? ''
+    const values = new Map<string, string>([
+      ['merchantSku', product.sku.toUpperCase().replace(/\s+/g, '')],
+      ['UrunAdi', product.title],
+      ['UrunAciklamasi', firstText(product.description, product.title)],
+      ['Barcode', marketplaceBarcode(product.barcode, product.sku)],
+      ['Marka', MARKETPLACE_BRAND_NAME],
+      ['tax_vat_rate', firstText(xmlAttributes['kdv'], xmlAttributes['KDV'], '20')],
+      ['price', String(product.price).replace('.', ',')],
+      ['stock', String(product.stock)],
+      ...effectiveProductMedia(product).images.slice(0, 10).map((url, index): [string, string] => [`Image${index + 1}`, url]),
+    ])
+    const definitionById = new Map(definitions.map(definition => [definition.attributeId, definition]))
+
+    for (const [attributeId, valueText] of values) {
+      const definition = definitionById.get(attributeId)
+      if (!definition || !valueText) continue
+      await this.prisma.productAttribute.upsert({
+        where: {
+          productId_marketplace_attributeId: { productId, marketplace, attributeId },
+        },
+        update: {
+          attributeName: definition.attributeName,
+          valueId: null,
+          valueText,
+          isInherited: true,
+          savedBy: 'system:product-core',
+          savedAt: new Date(),
+        },
+        create: {
+          productId,
+          marketplace,
+          attributeId,
+          attributeName: definition.attributeName,
+          valueText,
+          isInherited: true,
+          savedBy: 'system:product-core',
+        },
+      })
+    }
+  }
+
   /**
    * API yanÄ±tÄ±nÄ± normalize eder
    */
@@ -481,6 +713,7 @@ export class CategoryAttributeService {
     if (marketplace === 'TRENDYOL') return this.normalizeTrendyolAttributes(data)
     if (marketplace === 'N11') return this.normalizeN11Attributes(data)
     if (marketplace === 'PAZARAMA') return this.normalizePazaramaAttributes(data)
+    if (marketplace === 'HEPSIBURADA') return this.normalizeHepsiburadaAttributes(data)
     return []
   }
 
@@ -556,6 +789,49 @@ export class CategoryAttributeService {
         values: extractAttributeValues(item),
         validationRules: {},
         displayOrder: index,
+      }
+    }).filter((attr: Attribute) => attr.attributeId && attr.attributeName)
+  }
+
+  private normalizeHepsiburadaAttributes(data: unknown): Attribute[] {
+    const root = data as any
+    const payload = root?.data ?? root
+    const attrs = [
+      ...(Array.isArray(payload?.baseAttributes) ? payload.baseAttributes : []),
+      ...(Array.isArray(payload?.attributes) ? payload.attributes : []),
+      ...(Array.isArray(payload?.variantAttributes) ? payload.variantAttributes : []),
+      ...(Array.isArray(root?.data)
+        ? root.data
+        : Array.isArray(root?.attributes)
+          ? root.attributes
+          : Array.isArray(root?.items)
+            ? root.items
+            : Array.isArray(root)
+              ? root
+              : []),
+    ]
+
+    return attrs.map((item: any, index: number) => {
+      const name = String(item?.name ?? item?.attributeName ?? item?.displayName ?? item?.label ?? '')
+      const values = extractAttributeValues(item)
+      const type = String(item?.type ?? item?.attributeType ?? '').toLocaleLowerCase('tr-TR')
+      const attributeType: Attribute['attributeType'] = values.length > 0 || type === 'enum' || isColorOrSizeLikeName(name)
+        ? 'dropdown'
+        : type.includes('number')
+          ? 'number'
+          : 'free_text'
+
+      return {
+        attributeId: String(item?.id ?? item?.attributeId ?? item?.name ?? item?.attributeName ?? ''),
+        attributeName: name,
+        attributeType,
+        isMandatory: Boolean(item?.mandatory ?? item?.required ?? item?.isMandatory),
+        allowCustomValue: values.length === 0 || Boolean(item?.allowCustomValue ?? item?.isCustomValue),
+        values,
+        validationRules: {
+          maxLength: Number.isFinite(Number(item?.maxLength)) ? Number(item.maxLength) : undefined,
+        },
+        displayOrder: Number(item?.displayOrder ?? item?.order ?? index),
       }
     }).filter((attr: Attribute) => attr.attributeId && attr.attributeName)
   }

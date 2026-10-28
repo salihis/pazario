@@ -40,7 +40,6 @@ export type OrderStatus =
 export interface TransitionOptions {
   changedBy: string
   note?: string
-  skipValidation?: boolean
 }
 
 // ─── GEÇERLİ DURUM GEÇİŞLERİ ────────────────────────────────────────────────
@@ -63,6 +62,23 @@ const VALID_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   REFUNDED:               [],
 }
 
+export function findValidTransitionPath(from: OrderStatus, to: OrderStatus): OrderStatus[] | null {
+  if (from === to) return []
+  const queue: Array<{ status: OrderStatus; path: OrderStatus[] }> = [{ status: from, path: [] }]
+  const visited = new Set<OrderStatus>([from])
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    for (const next of VALID_TRANSITIONS[current.status] ?? []) {
+      if (visited.has(next)) continue
+      const path = [...current.path, next]
+      if (next === to) return path
+      visited.add(next)
+      queue.push({ status: next, path })
+    }
+  }
+  return null
+}
+
 // ─── DURUM MAKİNESİ ───────────────────────────────────────────────────────────
 
 export class OrderStateMachine {
@@ -78,6 +94,28 @@ export class OrderStateMachine {
     toStatus: OrderStatus,
     options: TransitionOptions
   ): Promise<void> {
+    await this.transitionStep(orderId, toStatus, options, true)
+  }
+
+  async syncExternalStatus(orderId: string, toStatus: OrderStatus, marketplace: string): Promise<void> {
+    const order = await this.prisma.order.findUnique({ where: { id: orderId }, select: { status: true } })
+    if (!order) throw new Error(`Siparis bulunamadi: ${orderId}`)
+    const path = findValidTransitionPath(order.status as OrderStatus, toStatus)
+    if (path === null) throw new InvalidTransitionError(order.status, toStatus)
+    for (const status of path) {
+      await this.transitionStep(orderId, status, {
+        changedBy: 'marketplace-sync',
+        note: `${marketplace} harici durum yakalama senkronizasyonu`,
+      }, false)
+    }
+  }
+
+  private async transitionStep(
+    orderId: string,
+    toStatus: OrderStatus,
+    options: TransitionOptions,
+    triggerSideEffects: boolean
+  ): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       // SELECT FOR UPDATE — eş zamanlı güncelleme engeli
       const orders = await tx.$queryRaw<{ id: string; status: string }[]>`
@@ -90,11 +128,9 @@ export class OrderStateMachine {
       const fromStatus = order.status as OrderStatus
 
       // Geçiş validasyonu
-      if (!options.skipValidation) {
-        const allowed = VALID_TRANSITIONS[fromStatus] ?? []
-        if (!allowed.includes(toStatus)) {
-          throw new InvalidTransitionError(fromStatus, toStatus)
-        }
+      const allowed = VALID_TRANSITIONS[fromStatus] ?? []
+      if (!allowed.includes(toStatus)) {
+        throw new InvalidTransitionError(fromStatus, toStatus)
       }
 
       // Durumu güncelle
@@ -115,7 +151,7 @@ export class OrderStateMachine {
       })
 
       // Yan etkileri tetikle
-      await this.triggerSideEffect(tx, toStatus, orderId)
+      if (triggerSideEffects) await this.triggerSideEffect(tx, toStatus, orderId)
     })
   }
 

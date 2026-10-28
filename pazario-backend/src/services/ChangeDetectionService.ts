@@ -70,7 +70,9 @@ export class ChangeDetectionService {
           id: true,
           externalId: true,
           contentHash: true,
+          stock: true,
           categoryRaw: true,
+          images: true,
         },
       })
       const existingRowsInScope = existingRows.filter(row =>
@@ -78,8 +80,8 @@ export class ChangeDetectionService {
       )
 
       // externalId â†’ { id, contentHash } map'i
-      const existingMap = new Map<string, { id: string; contentHash: string }>(
-        existingRowsInScope.map(r => [r.externalId, { id: r.id, contentHash: r.contentHash }])
+      const existingMap = new Map<string, { id: string; contentHash: string; stock: number; images: string[] }>(
+        existingRowsInScope.map(r => [r.externalId, { id: r.id, contentHash: r.contentHash, stock: r.stock, images: r.images }])
       )
 
       // â”€â”€ 2. Gelen Ã¼rÃ¼nleri sÄ±nÄ±flandÄ±r â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -95,7 +97,11 @@ export class ChangeDetectionService {
         if (!existing) {
           // DB'de yok â†’ YENÄ°
           newProducts.push(product)
-        } else if (existing.contentHash !== product.contentHash) {
+        } else if (
+          existing.contentHash !== product.contentHash
+          || (typeof existing.stock === 'number' && existing.stock !== product.stock)
+          || (Array.isArray(existing.images) && JSON.stringify(existing.images) !== JSON.stringify(product.images))
+        ) {
           // Hash farklÄ± â†’ DEÄÄ°ÅMÄ°Å
           changedProducts.push({ product, existingId: existing.id })
         } else {

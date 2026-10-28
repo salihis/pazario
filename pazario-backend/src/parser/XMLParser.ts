@@ -59,10 +59,18 @@ export interface ParseResult {
 
 export interface XMLParseOptions {
   preferredPriceFields?: string[]
+  generatedBarcodePrefix?: string
+  deduplicateBySku?: boolean
 }
 
 export function buildParseOptionsForSource(source?: { name?: string | null; url?: string | null }): XMLParseOptions {
-  const sourceKey = `${source?.name ?? ''} ${source?.url ?? ''}`.toLocaleLowerCase('tr-TR')
+  const sourceKey = `${source?.name ?? ''} ${source?.url ?? ''}`
+    .toLocaleLowerCase('tr-TR')
+    .replace(/ı/g, 'i')
+
+  if (sourceKey.includes('ebijuteri')) {
+    return { generatedBarcodePrefix: 'BRS1634', deduplicateBySku: true }
+  }
 
   if (sourceKey.includes('lunalora')) {
     return { preferredPriceFields: ['price', 'sitePrice', 'realPrice', 'salePrice'] }
@@ -140,10 +148,56 @@ function preferredPrice(node: Record<string, unknown>, fields: string[] | undefi
 /**
  * MD5 hash Ã¼retir: id + price + stock + title
  */
-function generateContentHash(id: string, price: number, stock: number, title: string): string {
+function generateContentHash(id: string, price: number, stock: number, title: string, sourceSpecificValue = ''): string {
+  const base = `${id}|${price}|${stock}|${title}`
   return createHash('md5')
-    .update(`${id}|${price}|${stock}|${title}`)
+    .update(sourceSpecificValue ? `${base}|${sourceSpecificValue}` : base)
     .digest('hex')
+}
+
+function generatedBarcode(prefix: string | undefined, sku: string): string | null {
+  if (!prefix) return null
+  const normalizedSku = sku.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_-]/g, '')
+  const value = `${prefix}${normalizedSku}`
+  return normalizedSku && value.length <= 20 ? value : null
+}
+
+function productQualityScore(product: ParsedProduct): number {
+  return (product.stock > 0 ? 1_000_000 : 0)
+    + Object.keys(product.attributes).length * 100
+    + product.images.length * 10
+    + (product.description?.length ?? 0)
+}
+
+function finalizeProducts(
+  products: ParsedProduct[],
+  options: XMLParseOptions,
+  errors: ParseError[],
+): ParsedProduct[] {
+  if (!options.deduplicateBySku) return products
+
+  const bySku = new Map<string, ParsedProduct>()
+  let duplicates = 0
+  for (const product of products) {
+    const existing = bySku.get(product.sku)
+    if (!existing) {
+      bySku.set(product.sku, product)
+      continue
+    }
+    duplicates++
+    if (productQualityScore(product) > productQualityScore(existing)) {
+      bySku.set(product.sku, product)
+    }
+  }
+
+  if (duplicates > 0) {
+    errors.push({
+      type: 'WARN',
+      code: 'DUPLICATE_SKU',
+      message: `${duplicates} tekrar eden stok kodu tekillestirildi; stoklu ve daha zengin kayit korundu`,
+    })
+  }
+  return Array.from(bySku.values())
 }
 
 /**
@@ -179,6 +233,15 @@ function firstNonEmpty(...values: unknown[]): string {
  * Ham node'dan image URL array'i Ã§eker
  */
 function extractImages(node: Record<string, unknown>): string[] {
+  const mainImage = str(node['AnaGorsel'])
+  const otherImagesRoot = node['DigerGorseller'] as Record<string, unknown> | undefined
+  const otherImages = asArray(otherImagesRoot?.['Gorsel'])
+    .map(str)
+    .filter(Boolean)
+  if (mainImage || otherImages.length > 0) {
+    return Array.from(new Set([mainImage, ...otherImages].filter(Boolean)))
+  }
+
   const candidates = [
     node['g:image_link'], node['image_link'],
     node['image'], node['Image'], node['IMAGE'],
@@ -272,11 +335,50 @@ function expandTicimaxProducts(items: unknown): unknown[] {
     }
 
     const product = item as Record<string, unknown>
-    const baseId = str(product['UrunKartiID'] ?? product['id'] ?? product['ID'] ?? product['ProductId'] ?? product['productId'])
+    const baseId = str(product['UrunKartiID'] ?? product['UrunKodu'] ?? product['id'] ?? product['ID'] ?? product['ProductId'] ?? product['productId'])
     const baseSku = str(product['StokKodu'] ?? product['StockCode'] ?? product['stockCode'] ?? product['sku'] ?? product['SKU'] ?? baseId)
     const optionsRoot = product['UrunSecenek'] as Record<string, unknown> | undefined
     const rawOptions = optionsRoot?.['Secenek']
     const options = Array.isArray(rawOptions) ? rawOptions : rawOptions ? [rawOptions] : []
+
+    const variantsRoot = product['Varyantlar'] as Record<string, unknown> | undefined
+    const rawVariants = variantsRoot?.['Varyant']
+    const variants = asArray(rawVariants).filter(variant => variant && typeof variant === 'object')
+
+    if (options.length === 0 && variants.length > 0) {
+      variants.forEach((rawVariant, index) => {
+        const variant = rawVariant as Record<string, unknown>
+        const variantBarcode = firstNonEmpty(variant['Barkod'], variant['Barcode'], variant['barcode'])
+        const variantSku = firstNonEmpty(
+          variant['StokKodu'],
+          variant['SKU'],
+          variant['sku'],
+          variantBarcode,
+          `${baseSku}-${index + 1}`,
+        )
+        const variantId = firstNonEmpty(
+          variant['ID'],
+          variant['id'],
+          variantBarcode ? `${baseId}-${variantBarcode}` : '',
+          `${baseId}-${index + 1}`,
+        )
+
+        expanded.push({
+          ...product,
+          ...variant,
+          id: variantId,
+          sku: variantSku,
+          barcode: variantBarcode,
+          stock: variant['Stok'] ?? variant['ToplamStok'] ?? product['ToplamStok'],
+          BayiFiyat: variant['BayiFiyat'] ?? product['BayiFiyat'],
+          PerakendeFiyat: variant['PerakendeFiyat'] ?? product['PerakendeFiyat'],
+          Varyantlar: undefined,
+          variantParentId: baseId,
+          variantParentSku: baseSku,
+        })
+      })
+      continue
+    }
 
     if (options.length === 0) {
       expanded.push(product)
@@ -489,8 +591,12 @@ export class XMLParser {
       }
     }
 
-    // 50MB Ã¼stÃ¼ stream moduna geÃ§
+    // Large <products><product> feeds must be parsed product-by-product.
+    // Parsing the full XML into one JS object can exceed the heap on small cloud instances.
     if (Buffer.byteLength(xml, 'utf8') > STREAM_THRESHOLD_BYTES) {
+      if (/<products[\s>]/i.test(xml) && /<product[\s>]/i.test(xml)) {
+        return this.parseLargeProductBlocks(xml, options)
+      }
       return this.parseStream(Readable.from([xml]), options)
     }
 
@@ -531,11 +637,12 @@ export class XMLParser {
       }
     }
 
+    const finalizedProducts = finalizeProducts(products, options, errors)
     return {
-      products,
+      products: finalizedProducts,
       meta: {
         totalNodes: nodes.length,
-        parsed: products.length,
+        parsed: finalizedProducts.length,
         failed,
         durationMs: Date.now() - startTime,
         feedType,
@@ -601,14 +708,91 @@ export class XMLParser {
       }
     }
 
+    const finalizedProducts = finalizeProducts(products, options, errors)
     return {
-      products,
+      products: finalizedProducts,
       meta: {
         totalNodes: nodes.length,
-        parsed: products.length,
+        parsed: finalizedProducts.length,
         failed,
         durationMs: Date.now() - startTime,
         feedType,
+      },
+      errors,
+    }
+  }
+
+  private async parseLargeProductBlocks(xml: string, options: XMLParseOptions = {}): Promise<ParseResult> {
+    const startTime = Date.now()
+    const errors: ParseError[] = []
+    const products: ParsedProduct[] = []
+    let totalNodes = 0
+    let failed = 0
+    const productRegex = /<product\b[^>]*>[\s\S]*?<\/product>/gi
+
+    for (const match of xml.matchAll(productRegex)) {
+      totalNodes++
+
+      try {
+        const blockXml = sanitizeXml(`<products>${match[0]}</products>`)
+        const parsed = this.parser.parse(blockXml) as Record<string, unknown>
+        const { nodes } = this.extractNodes(parsed)
+
+        if (nodes.length === 0) {
+          failed++
+          errors.push({
+            type: 'WARN',
+            code: 'NORMALIZE_SKIP',
+            message: `Urun normalize edilemedi: product block ${totalNodes}`,
+          })
+          continue
+        }
+
+        for (const node of nodes) {
+          try {
+            const product = this.normalizeNode(node as Record<string, unknown>, options)
+            if (product) {
+              products.push(product)
+            } else {
+              failed++
+              errors.push({
+                type: 'WARN',
+                code: 'NORMALIZE_SKIP',
+                message: `Urun normalize edilemedi: product block ${totalNodes}`,
+              })
+            }
+          } catch (e) {
+            failed++
+            errors.push({
+              type: 'ERROR',
+              code: 'NODE_PARSE_ERROR',
+              message: `Product block ${totalNodes}: ${e instanceof Error ? e.message : String(e)}`,
+            })
+          }
+        }
+      } catch (e) {
+        failed++
+        errors.push({
+          type: 'ERROR',
+          code: 'NODE_PARSE_ERROR',
+          message: `Product block ${totalNodes}: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    }
+
+    if (totalNodes === 0) {
+      errors.push({ type: 'WARN', code: 'EMPTY_FEED', message: "Feed de urun bulunamadi" })
+    }
+
+    const finalizedProducts = finalizeProducts(products, options, errors)
+    return {
+      products: finalizedProducts,
+      meta: {
+        totalNodes,
+        parsed: finalizedProducts.length,
+        failed,
+        durationMs: Date.now() - startTime,
+        feedType: 'CUSTOM_PRODUCTS',
       },
       errors,
     }
@@ -686,11 +870,11 @@ export class XMLParser {
    */
   private normalizeNode(node: Record<string, unknown>, options: XMLParseOptions = {}): ParsedProduct | null {
     // ID
-    const id = str(node['g:id'] ?? node['id'] ?? node['ID'] ?? node['ProductId'] ?? node['productId'] ?? node['ProductCode'] ?? node['product_id'] ?? node['VaryasyonID'] ?? node['UrunKartiID'])
+    const id = str(node['g:id'] ?? node['id'] ?? node['ID'] ?? node['ProductId'] ?? node['productId'] ?? node['ProductCode'] ?? node['product_id'] ?? node['VaryasyonID'] ?? node['UrunKartiID'] ?? node['UrunKodu'])
     if (!id) return null
 
     // Title
-    const title = str(node['g:title'] ?? node['title'] ?? node['Title'] ?? node['TITLE'] ?? node['name'] ?? node['Name'] ?? node['ProductName'] ?? node['adi'] ?? node['UrunAdi'])
+    const title = str(node['g:title'] ?? node['title'] ?? node['Title'] ?? node['TITLE'] ?? node['name'] ?? node['Name'] ?? node['ProductName'] ?? node['adi'] ?? node['Ad'] ?? node['UrunAdi'])
     if (!title) return null
 
     // SKU
@@ -698,7 +882,9 @@ export class XMLParser {
 
     // Barcode
     const rawBarcode = str(node['barcode'] ?? node['Barcode'] ?? node['Barkod'] ?? node['g:gtin'] ?? node['gtin'] ?? node['EAN'])
-    const barcode = rawBarcode && rawBarcode.length <= 20 ? rawBarcode : null
+    const barcode = rawBarcode && rawBarcode.length <= 20
+      ? rawBarcode
+      : generatedBarcode(options.generatedBarcodePrefix, sku)
 
     // Price
     const fiyat = node['fiyat'] as Record<string, unknown> | undefined
@@ -715,6 +901,9 @@ export class XMLParser {
       node['PRICE'],
       node['salePrice'],
       node['IndirimliFiyat'],
+      node['BayiFiyat'],
+      node['ToptanFiyat'],
+      node['PerakendeFiyat'],
       node['SatisFiyati'],
       fiyat?.['bayi_fiyati'],
       fiyat?.['son_kullanici']
@@ -723,11 +912,11 @@ export class XMLParser {
     if (!priceResult) return null
 
     // List Price
-    const rawListPrice = node['g:list_price'] ?? node['listPrice'] ?? node['ListPrice'] ?? node['list_price'] ?? node['SatisFiyati'] ?? fiyat?.['son_kullanici']
+    const rawListPrice = node['g:list_price'] ?? node['listPrice'] ?? node['ListPrice'] ?? node['list_price'] ?? node['PerakendeFiyat'] ?? node['SatisFiyati'] ?? fiyat?.['son_kullanici']
     const listPriceResult = parseTurkishPrice(rawListPrice)
 
     // Stock
-    const rawStock = node['stock'] ?? node['Stock'] ?? node['quantity'] ?? node['Quantity'] ?? node['stockCount'] ?? node['miktar'] ?? node['StokAdedi']
+    const rawStock = node['stock'] ?? node['Stock'] ?? node['quantity'] ?? node['Quantity'] ?? node['stockCount'] ?? node['miktar'] ?? node['Stok'] ?? node['StokAdedi'] ?? node['ToplamStok']
     const stock = rawStock !== undefined ? parseInt(String(rawStock), 10) : 0
 
     // Currency
@@ -743,6 +932,7 @@ export class XMLParser {
       node['detail'],
       node['aciklama'],
       node['Aciklama'],
+      node['KisaAciklama'],
       node['OnYazi']
     ) || null
 
@@ -768,7 +958,13 @@ export class XMLParser {
     }
 
     // Content Hash
-    const contentHash = generateContentHash(id, priceResult.price, stock, title)
+    const contentHash = generateContentHash(
+      id,
+      priceResult.price,
+      stock,
+      title,
+      options.generatedBarcodePrefix ? barcode ?? '' : ''
+    )
 
     return {
       id,
